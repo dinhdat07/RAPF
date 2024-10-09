@@ -1,0 +1,2 @@
+- dataset_root=E:/CODING/Machine Learning/dataset/imagenet-100
+- class_order=class_orders/imagenet100.yaml
