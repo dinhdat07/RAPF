@@ -1,4 +1,4 @@
-hydra:
+﻿hydra:
   run:
     dir: ./experiments/${scenario}/${dataset}_${initial_increment}-${increment}_without_exp
   job:
@@ -37,3 +37,24 @@ beta: 2
 mix_bias: 0.6
 threshold: 0.55
 shrinkage: false
+enable_engine_otf: null
+enable_engine_ptk: null
+engine_descriptor_json: "chat/cifar224_des.json"
+engine_alpha: null
+
+engine:
+  enable_otf: false
+  otf_text: true
+  otf_visual: true
+  ptk: false
+  alpha: 0.7
+  topk: 5
+  descriptor_json: "chat/cifar224_des.json"
+  text_template: "a photo of a {}, detailed"
+  num_prompts_cap: 8
+  strong_aug:
+    randaugment_n: 2
+    randaugment_m: 9
+    color_jitter: [0.4, 0.4, 0.4, 0.1]
+    random_erasing_p: 0.25
+

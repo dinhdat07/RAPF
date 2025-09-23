@@ -7,7 +7,9 @@ from omegaconf import DictConfig
 import clip
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
+from .knowledge_injection import TextPromptBank, VisualAugEncoder
 from .utils import get_class_ids_per_task, get_class_names
 
 class Mlp(nn.Module):
@@ -71,6 +73,21 @@ class ClassIncrementalCLIP(nn.Module):
         self.adapter = nn.Linear(512, 512, bias=False ,device=device)
         self.clip_type = model.dtype
 
+        self.engine_cfg = getattr(cfg, 'engine', None)
+        self.text_prompt_bank = None
+        self.visual_aug_encoder = None
+        self.engine_otf_text = bool(
+            self.engine_cfg
+            and getattr(self.engine_cfg, 'enable_otf', False)
+            and getattr(self.engine_cfg, 'otf_text', False)
+        )
+        self.engine_otf_visual = bool(
+            self.engine_cfg
+            and getattr(self.engine_cfg, 'enable_otf', False)
+            and getattr(self.engine_cfg, 'otf_visual', False)
+        )
+        self.class_name_features = None
+
 
         # old adapter
         self.old_adapter = None
@@ -102,25 +119,59 @@ class ClassIncrementalCLIP(nn.Module):
         return x
     
     def encode_image(self, image):
-         # 确保输入数据类型与 self.visual 的权重类型一致
+         # Ensure the input dtype matches the visual branch weights
         image = image.to(self.clip_type)
         return self.visual(image)
 
-    
+    def set_text_prompt_bank(self, prompt_bank):
+        self.text_prompt_bank = prompt_bank
+        if prompt_bank is not None:
+            prompt_bank.register_encoder(self.encode_text, self.device, self.clip_type)
+
+    def set_visual_aug_encoder(self, aug_encoder):
+        self.visual_aug_encoder = aug_encoder
+        if aug_encoder is not None:
+            aug_encoder.register_encoder(self.encode_image, self.device, self.clip_type)
+
+    def _use_engine_text(self):
+        return bool(self.engine_otf_text and self.text_prompt_bank is not None)
+
+    def _use_engine_visual(self):
+        return bool(self.engine_otf_visual and self.visual_aug_encoder is not None)
+
     @torch.no_grad()
     def get_class_name_features(self):
-        class_name_features = self.encode_text(self.text_tokens)
+        if self._use_engine_text():
+            prototypes = []
+            for class_name in self.current_class_names:
+                prompt_features = self.text_prompt_bank.encode_multi(class_name)
+                prototypes.append(prompt_features.mean(dim=0))
+            if prototypes:
+                class_name_features = torch.stack(prototypes)
+            else:
+                class_name_features = self.encode_text(self.text_tokens)
+        else:
+            class_name_features = self.encode_text(self.text_tokens)
+        class_name_features = F.normalize(class_name_features.float(), dim=-1)
         return class_name_features.type(torch.float32)
 
     def forward(self, image, ori_ima_f=False, memory_data=None, not_ini=False, edge_sample=None, prompt=False):
         image = image.type(torch.float16)
         with torch.no_grad():
-            text_features = self.encode_text(self.text_tokens)
+            text_features = (
+                self.class_name_features
+                if self.class_name_features is not None
+                else self.encode_text(self.text_tokens)
+            )
 
 
         with torch.no_grad():
             image_features = self.encode_image(image)
             original_image_features = image_features.clone()
+            if self._use_engine_visual():
+                aug_features = self.visual_aug_encoder.encode_image_aug(image)
+                combined = torch.stack((image_features.float(), aug_features.float()), dim=0).mean(dim=0)
+                image_features = F.normalize(combined, dim=-1).type_as(image_features)
         if memory_data is not None:
             memory_data = memory_data.type(self.dtype)
             image_features = torch.cat([image_features, memory_data], dim=0)

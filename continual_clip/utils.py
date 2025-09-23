@@ -1,4 +1,4 @@
-
+﻿
 import os
 import json
 import yaml
@@ -38,4 +38,16 @@ def get_workdir(path):
     workdir_idx = split_path.index("RAPF") # If a 'ValueError' occurs, replace 'RAPF' with your actual work directory
     return "/".join(split_path[:workdir_idx+1])
 
+def get_engine_descriptor_path(workdir: str, dataset_name: str) -> Optional[str]:
+    mapping = {
+        'cifar100': os.path.join('chat', 'cifar224_des.json'),
+        'imagenet_r': os.path.join('chat', 'imagenetr_des.json'),
+        'cub200': os.path.join('chat', 'cub_des.json'),
+    }
+    dataset_key = dataset_name.lower() if dataset_name else ''
+    candidate = mapping.get(dataset_key)
+    if not candidate:
+        return None
+    candidate_path = os.path.normpath(os.path.join(workdir, candidate))
+    return candidate_path if os.path.isfile(candidate_path) else None
 

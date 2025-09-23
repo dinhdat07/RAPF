@@ -6,7 +6,7 @@ import pdb
 import random
 import hydra
 import logging
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 import torch
 import statistics
@@ -16,6 +16,7 @@ from continuum.metrics import Logger
 from tqdm import tqdm
 from continual_clip import utils
 from continual_clip.models import load_model, sample
+from continual_clip.knowledge_injection import TextPromptBank, VisualAugEncoder, engine_rerank
 from continual_clip.datasets import build_cl_scenarios
 import numpy as np
 
@@ -32,7 +33,60 @@ def seed_everything(seed=0):
 def run_class_incremental(cfg, device):
 
     cfg.class_order = utils.get_class_order(os.path.join(cfg.workdir, cfg.class_order))
+    if hasattr(cfg, 'engine') and cfg.engine is not None:
+        if getattr(cfg, 'enable_engine_otf', None) is not None:
+            cfg.engine.enable_otf = bool(cfg.enable_engine_otf)
+        if getattr(cfg, 'enable_engine_ptk', None) is not None:
+            cfg.engine.ptk = bool(cfg.enable_engine_ptk)
+        if getattr(cfg, 'engine_descriptor_json', None):
+            cfg.engine.descriptor_json = cfg.engine_descriptor_json
+        if getattr(cfg, 'engine_alpha', None) is not None:
+            cfg.engine.alpha = float(cfg.engine_alpha)
     model = load_model(cfg, device)
+
+    engine_cfg = getattr(cfg, "engine", None)
+    text_prompt_bank = None
+    visual_aug_encoder = None
+    ptk_enabled = False
+    engine_alpha = 0.7
+    engine_rerank_topk = 5
+    if engine_cfg is not None:
+        ptk_enabled = bool(getattr(engine_cfg, "ptk", False))
+        engine_alpha = float(getattr(engine_cfg, "alpha", 0.7))
+        engine_rerank_topk = int(getattr(engine_cfg, "topk", 5))
+        descriptor_path = getattr(engine_cfg, "descriptor_json", "") or ""
+        if not descriptor_path:
+            fallback_descriptor = utils.get_engine_descriptor_path(cfg.workdir, cfg.dataset)
+            if fallback_descriptor:
+                descriptor_path = fallback_descriptor
+        needs_text_bank = bool(
+            ptk_enabled
+            or (
+                getattr(engine_cfg, "enable_otf", False)
+                and getattr(engine_cfg, "otf_text", False)
+            )
+        )
+        if needs_text_bank:
+            resolved_descriptor = descriptor_path
+            if resolved_descriptor and not os.path.isabs(resolved_descriptor):
+                resolved_descriptor = os.path.join(cfg.workdir, resolved_descriptor)
+            template = getattr(engine_cfg, "text_template", cfg.prompt_template)
+            prompts_cap = getattr(engine_cfg, "num_prompts_cap", None)
+            text_prompt_bank = TextPromptBank(
+                descriptor_json=resolved_descriptor,
+                template=template,
+                num_prompts_cap=prompts_cap,
+            )
+            model.set_text_prompt_bank(text_prompt_bank)
+        if getattr(engine_cfg, "enable_otf", False) and getattr(engine_cfg, "otf_visual", False):
+            strong_aug_cfg = getattr(engine_cfg, "strong_aug", {})
+            if isinstance(strong_aug_cfg, DictConfig):
+                strong_aug_cfg = OmegaConf.to_container(strong_aug_cfg, resolve=True)
+            visual_aug_encoder = VisualAugEncoder(
+                base_preprocess=model.transforms,
+                strong_aug_cfg=strong_aug_cfg,
+            )
+            model.set_visual_aug_encoder(visual_aug_encoder)
     eval_dataset, classes_names = build_cl_scenarios(
         cfg, is_train=False, transforms=model.transforms
     )
@@ -151,8 +205,16 @@ def run_class_incremental(cfg, device):
         for inputs, targets, task_ids in eval_loader:
             inputs, targets = inputs.to(device), targets.to(device)
             with torch.no_grad():
-                outputs, _, __, ___ = model(inputs)
-                torch.nn.functional.softmax(outputs, dim=-1)
+                outputs, image_features, __, ___ = model(inputs)
+                if ptk_enabled and text_prompt_bank is not None:
+                    outputs = engine_rerank(
+                        image_features,
+                        outputs,
+                        model.current_class_names,
+                        text_prompt_bank,
+                        alpha=engine_alpha,
+                        topk=engine_rerank_topk,
+                    )
             metric_logger.add([outputs.cpu().argmax(dim=1), targets.cpu(), task_ids], subset="test")
 
         acc_list.append(100 * metric_logger.accuracy)
