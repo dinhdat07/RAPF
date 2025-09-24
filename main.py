@@ -1,4 +1,4 @@
-
+﻿
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import json
@@ -15,8 +15,9 @@ from continuum.metrics import Logger
 
 from tqdm import tqdm
 from continual_clip import utils
-from continual_clip.models import load_model, sample
+from continual_clip.models import ClassIncrementalCLIP, load_model, sample
 from continual_clip.knowledge_injection import TextPromptBank, VisualAugEncoder, engine_rerank
+from continual_clip.losses import pair_contrastive_loss
 from continual_clip.datasets import build_cl_scenarios
 import numpy as np
 
@@ -42,6 +43,14 @@ def run_class_incremental(cfg, device):
             cfg.engine.descriptor_json = cfg.engine_descriptor_json
         if getattr(cfg, 'engine_alpha', None) is not None:
             cfg.engine.alpha = float(cfg.engine_alpha)
+        if getattr(cfg, 'engine_lambda_img', None) is not None:
+            cfg.engine.lambda_img = float(cfg.engine_lambda_img)
+        if getattr(cfg, 'engine_lambda_txt', None) is not None:
+            cfg.engine.lambda_txt = float(cfg.engine_lambda_txt)
+        if getattr(cfg, 'engine_replay_alpha', None) is not None:
+            cfg.engine.replay_alpha = float(cfg.engine_replay_alpha)
+        if getattr(cfg, 'engine_sample_num', None) is not None:
+            cfg.engine.sample_num = int(cfg.engine_sample_num)
     model = load_model(cfg, device)
 
     engine_cfg = getattr(cfg, "engine", None)
@@ -103,7 +112,11 @@ def run_class_incremental(cfg, device):
         train_loader = DataLoader(train_dataset[task_id], batch_size=cfg.train_batch_size, shuffle=True, num_workers=cfg.num_workers)
         # epoch
         model.train()
-        optimizer = torch.optim.Adam(model.adapter.parameters(), lr=cfg.lr, weight_decay=0.0000)
+        if hasattr(model, 'get_trainable_parameters'):
+            trainable_params = list(model.get_trainable_parameters())
+        else:
+            trainable_params = list(model.adapter.parameters())
+        optimizer = torch.optim.AdamW(trainable_params, lr=cfg.lr, weight_decay=0.0)
 
         milestones = cfg.milestones
         epochs = cfg.epochs
@@ -111,7 +124,6 @@ def run_class_incremental(cfg, device):
         scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones, gamma=0.1, last_epoch=-1)
         for i_epoch in range(epochs):
             loss = torch.tensor(0.0).to(device)
-            loss_c = torch.tensor(0.0).to(device)
             loss_hinge = torch.tensor(0.0).to(device)
             tqdm_loader = tqdm(train_loader)
             if task_id >0:
@@ -137,9 +149,18 @@ def run_class_incremental(cfg, device):
                         list_for_one_batch = [random_class_order_list[batch_id*10%len(random_class_order_list)], random_class_order_list[(batch_id*10+1)%len(random_class_order_list)], random_class_order_list[(batch_id*10+2)%len(random_class_order_list)], random_class_order_list[(batch_id*10+3)%len(random_class_order_list)], random_class_order_list[(batch_id*10+4)%len(random_class_order_list)], random_class_order_list[(batch_id*10+5)%len(random_class_order_list)], random_class_order_list[(batch_id*10+6)%len(random_class_order_list)], random_class_order_list[(batch_id*10+7)%len(random_class_order_list)], random_class_order_list[(batch_id*10+8)%len(random_class_order_list)], random_class_order_list[(batch_id*10+9)%len(random_class_order_list)]]
                     else:
                         list_for_one_batch = [random_class_order_list[batch_id*2%len(random_class_order_list)], random_class_order_list[(batch_id*2+1)%len(random_class_order_list)]]
+                    
+                    if getattr(model, 'replay_sample_num', 0) > 0:
+                        k = min(len(list_for_one_batch), model.replay_sample_num)
+                        list_for_one_batch = random.sample(list_for_one_batch, k)
+
                     for i in list_for_one_batch:
-                        sg_inputs.append(sample(model.class_mean_list[i], model.class_cov_list[i],int(10*cfg.beta), shrink=cfg.shrinkage))
+                        proto = sample(model.class_mean_list[i], model.class_cov_list[i], int(10*cfg.beta), shrink=cfg.shrinkage)
+                        if getattr(model, 'replay_alpha', 0.0) > 0:
+                            proto = proto + torch.randn_like(proto) * model.replay_alpha
+                        sg_inputs.append(proto)
                         sg_targets.append(torch.ones(int(10*cfg.beta), dtype=torch.long, device=device)*i)
+
                     sg_inputs = torch.cat(sg_inputs, dim=0)
                     sg_targets = torch.cat(sg_targets, dim=0)
                     targets = torch.cat([targets, sg_targets], dim=0)
@@ -170,17 +191,45 @@ def run_class_incremental(cfg, device):
                         edge_nearest_class_features = model.class_name_features[edge_n_target].type(edge_sample_features.dtype)
                         edge_nearest_class_features = edge_nearest_class_features / edge_nearest_class_features.norm(dim=-1, keepdim=True)
                         loss_hinge = torch.relu(- (edge_sample_features * edge_target_features.clone().detach()).sum(-1) + (edge_sample_features * edge_nearest_class_features.clone().detach()).sum(-1) + 0.1).mean()
-                loss_c = torch.nn.functional.cross_entropy(outputs, targets.detach())
-                if edge_sample is not None:
-                    loss = loss_c + loss_hinge
-                else:
-                    loss = loss_c 
+                    else: 
+                        loss_hinge = 0
+            
+                
+                cache = model.get_last_forward_cache() if hasattr(model, 'get_last_forward_cache') else {}
+                batch_size_current = cache.get('batch_size', inputs.size(0))
+                image_embed = cache.get('combined_image_embeddings')
+                if image_embed is None:
+                    image_embed = cache.get('image_embeddings')
+                if image_embed is None:
+                    feature_dim = getattr(model, 'feature_dim', model.adapter.in_features if hasattr(model, 'adapter') else outputs.size(-1))
+                    image_embed = torch.zeros(batch_size_current, feature_dim, device=device, dtype=outputs.dtype)
+                image_embed = image_embed[:batch_size_current]
+                text_features_all = cache.get('final_text_features', model.class_name_features.type(outputs.dtype))
+                temperature = float(model.logit_scale.exp().detach())
+
+                image_aug_loss = torch.tensor(0.0, device=device)
+                aug_embed = cache.get('aug_image_embeddings')
+                if aug_embed is not None:
+                    image_aug_loss = pair_contrastive_loss(image_embed, aug_embed[:batch_size_current], temperature=temperature)
+
+                text_aug_loss = torch.tensor(0.0, device=device)
+                descriptor_embed = cache.get('descriptor_text_features')
+                if descriptor_embed is not None:
+                    text_aug_loss = pair_contrastive_loss(text_features_all, descriptor_embed, temperature=temperature)
+
+                loss_ce = torch.nn.functional.cross_entropy(outputs, targets.detach())
+                
+                loss = loss_ce + model.lambda_img * image_aug_loss + model.lambda_txt * text_aug_loss + loss_hinge
 
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
 
-                tqdm_loader.set_description(f"Epoch {i_epoch + 1}/{cfg.epochs} | Loss: {loss.item():.4f} | Loss_c: {loss_c.item():.4f}| loss_hinge: {loss_hinge.item():.4f} | lr: {scheduler.get_last_lr()[0]:.4f}")
+
+                tqdm_loader.set_description(
+                    f"Epoch {i_epoch + 1}/{cfg.epochs} | Loss: {loss.item():.4f} | L_ce: {loss_ce.item():.4f} | "
+                    f"L_img: {image_aug_loss.item():.4f} | L_txt: {text_aug_loss.item():.4f} | L_hinge: {loss_hinge.item():.4f} | lr: {scheduler.get_last_lr()[0]:.4f}"
+                )
             
             scheduler.step()
         sample_loader = DataLoader(train_dataset[task_id], batch_size=128, shuffle=False, num_workers=cfg.num_workers)
