@@ -11,13 +11,14 @@ from omegaconf import DictConfig, OmegaConf
 import torch
 import statistics
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
 from continuum.metrics import Logger
 
 from tqdm import tqdm
 from continual_clip import utils
 from continual_clip.models import ClassIncrementalCLIP, load_model, sample
 from continual_clip.knowledge_injection import TextPromptBank, VisualAugEncoder, engine_rerank
-from continual_clip.losses import pair_contrastive_loss
+from continual_clip.losses import engine_contrastive_loss
 from continual_clip.datasets import build_cl_scenarios
 import numpy as np
 
@@ -197,27 +198,32 @@ def run_class_incremental(cfg, device):
                 
                 cache = model.get_last_forward_cache() if hasattr(model, 'get_last_forward_cache') else {}
                 batch_size_current = cache.get('batch_size', inputs.size(0))
-                image_embed = cache.get('combined_image_embeddings')
+                image_embed = cache.get('image_embeddings')  # pre_adapter_norm
                 if image_embed is None:
-                    image_embed = cache.get('image_embeddings')
+                    image_embed = cache.get('combined_image_embeddings')
                 if image_embed is None:
                     feature_dim = getattr(model, 'feature_dim', model.adapter.in_features if hasattr(model, 'adapter') else outputs.size(-1))
                     image_embed = torch.zeros(batch_size_current, feature_dim, device=device, dtype=outputs.dtype)
+                
                 image_embed = image_embed[:batch_size_current]
                 text_features_all = cache.get('final_text_features', model.class_name_features.type(outputs.dtype))
-                temperature = float(model.logit_scale.exp().detach())
 
                 image_aug_loss = torch.tensor(0.0, device=device)
                 aug_embed = cache.get('aug_image_embeddings')
                 if aug_embed is not None:
-                    image_aug_loss = pair_contrastive_loss(image_embed, aug_embed[:batch_size_current], temperature=temperature)
+                    sim_img = F.normalize(image_embed, dim=-1) @ F.normalize(aug_embed[:batch_size_current], dim=-1).t()
+                    image_aug_loss = engine_contrastive_loss(sim_img)
 
                 text_aug_loss = torch.tensor(0.0, device=device)
                 descriptor_embed = cache.get('descriptor_text_features')
                 if descriptor_embed is not None:
-                    text_aug_loss = pair_contrastive_loss(text_features_all, descriptor_embed, temperature=temperature)
+                    labels = ori_targets[:batch_size_current] 
+                    z_temp = F.normalize(text_features_all[labels], dim=-1)            
+                    z_desc = F.normalize(descriptor_embed[labels], dim=-1)   
+                    sim_txt = z_temp @ z_desc.t()                             
+                    text_aug_loss = engine_contrastive_loss(sim_txt)
 
-                loss_ce = torch.nn.functional.cross_entropy(outputs, targets.detach())
+                loss_ce = F.cross_entropy(outputs, targets.detach())
                 
                 loss = loss_ce + model.lambda_img * image_aug_loss + model.lambda_txt * text_aug_loss + loss_hinge
 
@@ -227,8 +233,8 @@ def run_class_incremental(cfg, device):
 
 
                 tqdm_loader.set_description(
-                    f"Epoch {i_epoch + 1}/{cfg.epochs} | Loss: {loss.item():.4f} | L_ce: {loss_ce.item():.4f} | "
-                    f"L_img: {image_aug_loss.item():.4f} | L_txt: {text_aug_loss.item():.4f} | L_hinge: {loss_hinge.item():.4f} | lr: {scheduler.get_last_lr()[0]:.4f}"
+                    f"Ep {i_epoch + 1}/{cfg.epochs} | L: {loss.item():.4f} | Lc: {loss_ce.item():.4f} | "
+                    f"Li: {image_aug_loss.item():.4f} | Lt: {text_aug_loss.item():.4f} | Lh: {loss_hinge.item():.4f} | lr: {scheduler.get_last_lr()[0]:.4f}"
                 )
             
             scheduler.step()
@@ -307,23 +313,6 @@ def continual_clip(cfg: DictConfig) -> None:
 
 
     
-        
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 if __name__ == "__main__":
     continual_clip()

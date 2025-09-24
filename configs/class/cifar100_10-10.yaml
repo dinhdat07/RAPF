@@ -37,16 +37,12 @@ beta: 2
 mix_bias: 0.6
 threshold: 0.55
 shrinkage: false
-enable_engine_otf: null
-enable_engine_ptk: null
-engine_descriptor_json: "chat/cifar224_des.json"
-engine_alpha: null
 
 engine:
-  enable_otf: false
+  enable_otf: true
   otf_text: true
   otf_visual: true
-  ptk: false
+  ptk: true
   alpha: 0.7
   topk: 5
   descriptor_json: "chat/cifar224_des.json"

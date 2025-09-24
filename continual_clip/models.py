@@ -1,5 +1,3 @@
-﻿
-
 import copy
 import pdb
 from itertools import chain
@@ -27,7 +25,6 @@ class Mlp(nn.Module):
         x = self.fc2(x)
 
         return x
-
 def shrink_cov(cov):
     diag_mean = torch.mean(torch.diagonal(cov))
     off_diag = cov.clone()
@@ -193,9 +190,7 @@ class ClassIncrementalCLIP(nn.Module):
     def get_class_name_features(self):
         if self.base_text_features is None:
             self._update_text_buffers()
-        base = self.base_text_features
-        delta = self._apply_injections(self.text_injections, base)
-        final = base + delta
+        final = self._apply_injections(self.text_injections, self.base_text_features)
         final = F.normalize(final.float(), dim=-1)
         return final.type(torch.float32)
 
@@ -214,6 +209,7 @@ class ClassIncrementalCLIP(nn.Module):
         self._prepare_injection_units()
         self._update_text_buffers()
         self.class_name_features = self.get_class_name_features()
+
         self.queue_empty = True
         self.hard_pairs = None
         if task_id > 0:
@@ -240,8 +236,7 @@ class ClassIncrementalCLIP(nn.Module):
             base_image_features = self.encode_image(image).float()
         original_image_features = base_image_features.clone()
 
-        injection_delta = self._apply_injections(self.image_injections, base_image_features)
-        injected_image_features = base_image_features + injection_delta
+        injected_image_features = self._apply_injections(self.image_injections, base_image_features)
         pre_adapter_norm = F.normalize(injected_image_features, dim=-1)
 
         aug_image_features = None
