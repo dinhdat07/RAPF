@@ -52,6 +52,10 @@ engine:
   descriptor_json: "chat/cifar224_des.json"
   text_template: "a photo of a {}, detailed"
   num_prompts_cap: 8
+  lambda_img: 2.0
+  lambda_txt: 2.0
+  replay_alpha: 0.25
+  sample_num: 0
   strong_aug:
     randaugment_n: 2
     randaugment_m: 9
