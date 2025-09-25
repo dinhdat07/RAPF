@@ -17,8 +17,8 @@ from continuum.metrics import Logger
 from tqdm import tqdm
 from continual_clip import utils
 from continual_clip.models import ClassIncrementalCLIP, load_model, sample
-from continual_clip.knowledge_injection import TextPromptBank, VisualAugEncoder, engine_rerank
-from continual_clip.losses import engine_contrastive_loss
+from RAPF.continual_clip.prompt_bank import TextPromptBank, VisualAugEncoder, engine_rerank
+from continual_clip.losses import contrastive_loss, engine_contrastive_loss
 from continual_clip.datasets import build_cl_scenarios
 import numpy as np
 
@@ -36,14 +36,6 @@ def run_class_incremental(cfg, device):
 
     cfg.class_order = utils.get_class_order(os.path.join(cfg.workdir, cfg.class_order))
     if hasattr(cfg, 'engine') and cfg.engine is not None:
-        if getattr(cfg, 'enable_engine_otf', None) is not None:
-            cfg.engine.enable_otf = bool(cfg.enable_engine_otf)
-        if getattr(cfg, 'enable_engine_ptk', None) is not None:
-            cfg.engine.ptk = bool(cfg.enable_engine_ptk)
-        if getattr(cfg, 'engine_descriptor_json', None):
-            cfg.engine.descriptor_json = cfg.engine_descriptor_json
-        if getattr(cfg, 'engine_alpha', None) is not None:
-            cfg.engine.alpha = float(cfg.engine_alpha)
         if getattr(cfg, 'engine_lambda_img', None) is not None:
             cfg.engine.lambda_img = float(cfg.engine_lambda_img)
         if getattr(cfg, 'engine_lambda_txt', None) is not None:
@@ -52,96 +44,51 @@ def run_class_incremental(cfg, device):
             cfg.engine.replay_alpha = float(cfg.engine_replay_alpha)
         if getattr(cfg, 'engine_sample_num', None) is not None:
             cfg.engine.sample_num = int(cfg.engine_sample_num)
-    model = load_model(cfg, device)
-
-    engine_cfg = getattr(cfg, "engine", None)
-    text_prompt_bank = None
-    visual_aug_encoder = None
-    ptk_enabled = False
-    engine_alpha = 0.7
+    
+    # model = load_model(cfg, device)
+    model = ClassIncrementalCLIP(cfg, device)
+    engine_alpha = 0.8
     engine_rerank_topk = 5
-    if engine_cfg is not None:
-        ptk_enabled = bool(getattr(engine_cfg, "ptk", False))
-        engine_alpha = float(getattr(engine_cfg, "alpha", 0.7))
-        engine_rerank_topk = int(getattr(engine_cfg, "topk", 5))
-        descriptor_path = getattr(engine_cfg, "descriptor_json", "") or ""
-        if not descriptor_path:
-            fallback_descriptor = utils.get_engine_descriptor_path(cfg.workdir, cfg.dataset)
-            if fallback_descriptor:
-                descriptor_path = fallback_descriptor
-        needs_text_bank = bool(
-            ptk_enabled
-            or (
-                getattr(engine_cfg, "enable_otf", False)
-                and getattr(engine_cfg, "otf_text", False)
-            )
-        )
-        if needs_text_bank:
-            resolved_descriptor = descriptor_path
-            if resolved_descriptor and not os.path.isabs(resolved_descriptor):
-                resolved_descriptor = os.path.join(cfg.workdir, resolved_descriptor)
-            template = getattr(engine_cfg, "text_template", cfg.prompt_template)
-            prompts_cap = getattr(engine_cfg, "num_prompts_cap", None)
-            text_prompt_bank = TextPromptBank(
-                descriptor_json=resolved_descriptor,
-                template=template,
-                num_prompts_cap=prompts_cap,
-            )
-            model.set_text_prompt_bank(text_prompt_bank)
-        if getattr(engine_cfg, "enable_otf", False) and getattr(engine_cfg, "otf_visual", False):
-            strong_aug_cfg = getattr(engine_cfg, "strong_aug", {})
-            if isinstance(strong_aug_cfg, DictConfig):
-                strong_aug_cfg = OmegaConf.to_container(strong_aug_cfg, resolve=True)
-            visual_aug_encoder = VisualAugEncoder(
-                base_preprocess=model.transforms,
-                strong_aug_cfg=strong_aug_cfg,
-            )
-            model.set_visual_aug_encoder(visual_aug_encoder)
-    eval_dataset, classes_names = build_cl_scenarios(
-        cfg, is_train=False, transforms=model.transforms
-    )
 
-    train_dataset, _ = build_cl_scenarios(
-        cfg, is_train=True, transforms=model.transforms
-    )
+    eval_dataset, classes_names = build_cl_scenarios(cfg, is_train=False, transforms=model.transforms)
+    train_dataset, _ = build_cl_scenarios(cfg, is_train=True, transforms=model.transforms)
     model.classes_names = classes_names
+    model._get_text_des(dataname='cifar224') 
     acc_list = []
     metric_logger = Logger(list_subsets=["test"])
+
     for task_id, _ in enumerate(eval_dataset):
         logging.info(f"Train for task {task_id} has started.")
-        model.adaptation(task_id, threshold=cfg.threshold)
         train_loader = DataLoader(train_dataset[task_id], batch_size=cfg.train_batch_size, shuffle=True, num_workers=cfg.num_workers)
-        # epoch
+        
+        model.adaptation(task_id, threshold=cfg.threshold)
+        # model.update_stat(self._known_classes,self._total_classes, self.train_loader, self._device) ~ ENGINE
         model.train()
-        if hasattr(model, 'get_trainable_parameters'):
-            trainable_params = list(model.get_trainable_parameters())
-        else:
-            trainable_params = list(model.adapter.parameters())
-        optimizer = torch.optim.AdamW(trainable_params, lr=cfg.lr, weight_decay=0.0)
 
+        trainable_params = list(model.get_trainable_parameters())
+        optimizer = torch.optim.AdamW(trainable_params, lr=cfg.lr, weight_decay=0.0)
         milestones = cfg.milestones
         epochs = cfg.epochs
-
         scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones, gamma=0.1, last_epoch=-1)
+
         for i_epoch in range(epochs):
             loss = torch.tensor(0.0).to(device)
             loss_hinge = torch.tensor(0.0).to(device)
             tqdm_loader = tqdm(train_loader)
-            if task_id >0:
+            if task_id>0:
                 random_class_order_list = list(range(cfg.initial_increment+(task_id-1)*cfg.increment))
                 random.shuffle(random_class_order_list)
+            
             batch_id = -1
             for inputs, targets, task_ids in tqdm_loader:
                 batch_id += 1
+                
                 inputs, targets = inputs.to(device), targets.to(device)
                 sg_inputs = None
                 edge_sample = None
-                ori_targets = targets.clone()
                 if task_id > 0:
                     sg_inputs = []
                     sg_targets = []
-                    # num of classes per batch. Ensure an epoch traverses all classes at least once. 
-                    # For exemple, if there are 100 classes and 50 batches per epoch , there will be 2 classes per batch.
                     if cfg.dataset == "cifar100" and cfg.increment == 5:
                         list_for_one_batch = [random_class_order_list[batch_id*4%len(random_class_order_list)], random_class_order_list[(batch_id*4+1)%len(random_class_order_list)], random_class_order_list[(batch_id*4+2)%len(random_class_order_list)], random_class_order_list[(batch_id*4+3)%len(random_class_order_list)]]
                     elif cfg.dataset == "imagenet_R":
@@ -153,18 +100,18 @@ def run_class_incremental(cfg, device):
                     
                     if getattr(model, 'replay_sample_num', 0) > 0:
                         k = min(len(list_for_one_batch), model.replay_sample_num)
-                        list_for_one_batch = random.sample(list_for_one_batch, k)
+                        old_class = random.sample(list_for_one_batch, k)
 
-                    for i in list_for_one_batch:
+                    for i in old_class:
+                        # use cov,mean and shrinkage instead of sample noise like ENGINE
                         proto = sample(model.class_mean_list[i], model.class_cov_list[i], int(10*cfg.beta), shrink=cfg.shrinkage)
-                        if getattr(model, 'replay_alpha', 0.0) > 0:
-                            proto = proto + torch.randn_like(proto) * model.replay_alpha
                         sg_inputs.append(proto)
+                        # int(10*cfg.beta) instead of int(1) like ENGINE
                         sg_targets.append(torch.ones(int(10*cfg.beta), dtype=torch.long, device=device)*i)
-
                     sg_inputs = torch.cat(sg_inputs, dim=0)
                     sg_targets = torch.cat(sg_targets, dim=0)
                     targets = torch.cat([targets, sg_targets], dim=0)
+
                 if model.hard_pairs is not None and model.hard_pairs.shape[0] > 0:
                     edge_sample = []
                     edge_p_target = []
@@ -180,10 +127,11 @@ def run_class_incremental(cfg, device):
                     not_ini = True
                 else:
                     not_ini = False
-                outputs, _, __, edge_sample_features = model(inputs, memory_data=sg_inputs, not_ini=not_ini, edge_sample=edge_sample, prompt=False)
 
 
-
+                outputs, _, __, edge_sample_features, pre_image_feas = model(inputs, memory_data=sg_inputs, not_ini=not_ini, edge_sample=edge_sample)
+                
+                # RAPF: calculate loss hinge
                 if task_id>0:
                     if edge_sample is not None:
                         edge_sample_features = edge_sample_features / edge_sample_features.norm(dim=-1, keepdim=True)
@@ -194,47 +142,49 @@ def run_class_incremental(cfg, device):
                         loss_hinge = torch.relu(- (edge_sample_features * edge_target_features.clone().detach()).sum(-1) + (edge_sample_features * edge_nearest_class_features.clone().detach()).sum(-1) + 0.1).mean()
                     else: 
                         loss_hinge = 0
-            
                 
-                cache = model.get_last_forward_cache() if hasattr(model, 'get_last_forward_cache') else {}
-                batch_size_current = cache.get('batch_size', inputs.size(0))
-                image_embed = cache.get('image_embeddings')  # pre_adapter_norm
-                if image_embed is None:
-                    image_embed = cache.get('combined_image_embeddings')
-                if image_embed is None:
-                    feature_dim = getattr(model, 'feature_dim', model.adapter.in_features if hasattr(model, 'adapter') else outputs.size(-1))
-                    image_embed = torch.zeros(batch_size_current, feature_dim, device=device, dtype=outputs.dtype)
-                
-                image_embed = image_embed[:batch_size_current]
-                text_features_all = cache.get('final_text_features', model.class_name_features.type(outputs.dtype))
+                # ENGINE: calculate aug-image contrastive loss
+                if model.lambda_img > 0:
+                    with torch.no_grad():
+                        aug = torch.clamp(inputs + torch.randn_like(inputs) * 0.25, 0, 1)
+                    aug_feas = model.encode_image(aug).float()
+                    aug_feas = aug_feas / aug_feas.norm(dim=-1, keepdim=True)
+                    sim_img = pre_image_feas[:aug_feas.shape[0]] @ aug_feas.T
+                    image_aug_loss = contrastive_loss(sim_img)
 
-                image_aug_loss = torch.tensor(0.0, device=device)
-                aug_embed = cache.get('aug_image_embeddings')
-                if aug_embed is not None:
-                    sim_img = F.normalize(image_embed, dim=-1) @ F.normalize(aug_embed[:batch_size_current], dim=-1).t()
-                    image_aug_loss = engine_contrastive_loss(sim_img)
+                # ENGINE: get text features by targets and calculate text-des loss
+                labels = [classes_names[int(y)] for y in targets.tolist()]
+                texts_clip=[model.prompt_template.format(inst) for inst in labels]
+                with torch.no_grad():  
+                    clip_tokens = model.tokenize(texts_clip).to(model.device)
+                    clip_text_feas = model.encode_text(clip_tokens)
+                clip_text_feas = model.apply_injections(model.text_injections, clip_text_feas)
+                clip_text_feas = clip_text_feas /clip_text_feas.norm(dim=-1, keepdim=True)
 
-                text_aug_loss = torch.tensor(0.0, device=device)
-                descriptor_embed = cache.get('descriptor_text_features')
-                if descriptor_embed is not None:
-                    labels = ori_targets[:batch_size_current] 
-                    z_temp = F.normalize(text_features_all[labels], dim=-1)            
-                    z_desc = F.normalize(descriptor_embed[labels], dim=-1)   
-                    sim_txt = z_temp @ z_desc.t()                             
-                    text_aug_loss = engine_contrastive_loss(sim_txt)
+                if model.lambda_txt > 0:
+                    repeat_ = 1 
+                    ref_text_loss_list = []
+                    for _ in range(repeat_):
+                        ref_texts = model._get_batch_des(model.new_des_dict, labels)
+                        ref_emb = model.tokenize(ref_texts).to(model.device)
+                        with torch.no_grad():
+                            ref_text_features = model.encode_text(ref_emb)
+                        ref_text_features = ref_text_features / ref_text_features.norm(dim=-1, keepdim=True)
+                        ref_text_loss_list.append(contrastive_loss(clip_text_feas @ ref_text_features.T))
+                    ref_text_loss = sum(ref_text_loss_list) / len(ref_text_loss_list)
+                else:
+                    ref_text_loss = 0
 
+                # RAPF: calculate contrastive loss
                 loss_ce = F.cross_entropy(outputs, targets.detach())
                 
-                loss = loss_ce + model.lambda_img * image_aug_loss + model.lambda_txt * text_aug_loss + loss_hinge
-
+                loss = loss_ce + model.lambda_img * image_aug_loss + model.lambda_txt * ref_text_loss + loss_hinge
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
-
-
                 tqdm_loader.set_description(
                     f"Ep {i_epoch + 1}/{cfg.epochs} | L: {loss.item():.4f} | Lc: {loss_ce.item():.4f} | "
-                    f"Li: {image_aug_loss.item():.4f} | Lt: {text_aug_loss.item():.4f} | Lh: {loss_hinge.item():.4f} | lr: {scheduler.get_last_lr()[0]:.4f}"
+                    f"Li: {image_aug_loss.item():.4f} | Lt: {ref_text_loss.item():.4f} | Lh: {loss_hinge.item():.4f} | lr: {scheduler.get_last_lr()[0]:.4f}"
                 )
             
             scheduler.step()
@@ -256,20 +206,15 @@ def run_class_incremental(cfg, device):
         model.analyze_mean_cov(sample_data, sample_target)
         model.mix_matrix()
         model.eval()
+
         eval_loader = DataLoader(eval_dataset[:task_id + 1], batch_size=cfg.batch_size, num_workers=cfg.num_workers)
         for inputs, targets, task_ids in eval_loader:
             inputs, targets = inputs.to(device), targets.to(device)
             with torch.no_grad():
-                outputs, image_features, __, ___ = model(inputs)
-                if ptk_enabled and text_prompt_bank is not None:
-                    outputs = engine_rerank(
-                        image_features,
-                        outputs,
-                        model.current_class_names,
-                        text_prompt_bank,
-                        alpha=engine_alpha,
-                        topk=engine_rerank_topk,
-                    )
+                outputs, image_features, __, ___, pre_image_feas = model(inputs)
+                
+                # NEED TO IMPLEMENT THE ENGINE RERANKING FUNCTION!!!
+                # outputs = engine_rerank(image_features, outputs, model.total_class_names, text_prompt_bank, alpha=engine_alpha, topk=engine_rerank_topk)
             metric_logger.add([outputs.cpu().argmax(dim=1), targets.cpu(), task_ids], subset="test")
 
         acc_list.append(100 * metric_logger.accuracy)
