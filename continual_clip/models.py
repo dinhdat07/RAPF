@@ -123,20 +123,27 @@ class ClassIncrementalCLIP(nn.Module):
         for param in module.parameters():
             param.requires_grad = False
 
-    def update_injection_units(self):
-        if not self.engine_cfg or not getattr(self.engine_cfg, 'enable_otf', False):
-            return    
+    def update_injection_units(self):   
         if len(self.image_injections)>0:
             self.freeze(self.image_injections[-1])
             self.freeze(self.text_injections[-1])
-        self.image_injections.append(MLP_Adapter(512, 512))
-        self.text_injections.append(MLP_Adapter(512, 512))
+        self.image_injections.append(MLP_Adapter(512, 512).to(self.device))
+        self.text_injections.append(MLP_Adapter(512, 512).to(self.device))
     
     def apply_injections(self, modules: nn.ModuleList, features: torch.Tensor) -> torch.Tensor:
         res = []
         for i in range(len(modules)):
             res.append(modules[i](features))
         res = torch.sum(torch.stack(res), dim=0)
+        return res
+    
+    def apply_injections(self, modules: nn.ModuleList, features: torch.Tensor) -> torch.Tensor:
+        if len(modules) == 0:
+            return torch.zeros_like(features)
+        res = 0
+        features = features.float()  
+        for m in modules:
+            res = res + m(features)
         return res
     
     @torch.no_grad()
@@ -193,6 +200,7 @@ class ClassIncrementalCLIP(nn.Module):
         # not apply injection for edge samples
         pre_adapter = img_feas
         edge_num = 0
+
         if edge_sample is not None:
             edge_sample = edge_sample.type(self.dtype)
             edge_num = edge_sample.shape[0]
@@ -202,6 +210,7 @@ class ClassIncrementalCLIP(nn.Module):
         final_image_feas = self.adapter(pre_adapter.type(self.dtype).detach()).type(self.clip_type)
         final_image_feas = final_image_feas / final_image_feas.norm(dim=1, keepdim=True)
 
+        edge_sample_features = None
         if edge_sample is not None:
             edge_sample_features = final_image_feas[-edge_num:]
             final_image_feas = final_image_feas[:-edge_num]

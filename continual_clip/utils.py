@@ -1,6 +1,7 @@
 ﻿
 import os
 import json
+from pathlib import Path
 import yaml
 
 from omegaconf import DictConfig, OmegaConf
@@ -34,10 +35,15 @@ def save_config(config: DictConfig) -> None:
     OmegaConf.save(config, "config.yaml")
 
 
+# def get_workdir(path):
+#     split_path = path.split("/")
+#     workdir_idx = split_path.index("RAPF") # If a 'ValueError' occurs, replace 'RAPF' with your actual work directory
+#     return "/".join(split_path[:workdir_idx+1])
+
 def get_workdir(path):
-    split_path = path.split("/")
-    workdir_idx = split_path.index("RAPF") # If a 'ValueError' occurs, replace 'RAPF' with your actual work directory
-    return "/".join(split_path[:workdir_idx+1])
+    split_path = list(Path(path).resolve().parts)
+    workdir_idx = split_path.index("RAPF")  
+    return str(Path(*split_path[:workdir_idx+1]))
 
 def get_engine_descriptor_path(workdir: str, dataset_name: str) -> Optional[str]:
     mapping = {

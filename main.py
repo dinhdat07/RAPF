@@ -17,7 +17,6 @@ from continuum.metrics import Logger
 from tqdm import tqdm
 from continual_clip import utils
 from continual_clip.models import ClassIncrementalCLIP, load_model, sample
-from RAPF.continual_clip.prompt_bank import TextPromptBank, VisualAugEncoder, engine_rerank
 from continual_clip.losses import contrastive_loss, engine_contrastive_loss
 from continual_clip.datasets import build_cl_scenarios
 import numpy as np
@@ -101,6 +100,8 @@ def run_class_incremental(cfg, device):
                     if getattr(model, 'replay_sample_num', 0) > 0:
                         k = min(len(list_for_one_batch), model.replay_sample_num)
                         old_class = random.sample(list_for_one_batch, k)
+                    else:
+                        old_class = list_for_one_batch
 
                     for i in old_class:
                         # use cov,mean and shrinkage instead of sample noise like ENGINE
@@ -169,6 +170,7 @@ def run_class_incremental(cfg, device):
                         ref_emb = model.tokenize(ref_texts).to(model.device)
                         with torch.no_grad():
                             ref_text_features = model.encode_text(ref_emb)
+                        ref_text_features = ref_text_features.float() 
                         ref_text_features = ref_text_features / ref_text_features.norm(dim=-1, keepdim=True)
                         ref_text_loss_list.append(contrastive_loss(clip_text_feas @ ref_text_features.T))
                     ref_text_loss = sum(ref_text_loss_list) / len(ref_text_loss_list)
