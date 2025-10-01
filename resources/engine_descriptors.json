@@ -1,0 +1,29 @@
+﻿{
+  "tiger": {
+    "synonyms": ["bengal tiger", "striped big cat"],
+    "attributes": ["orange fur", "black stripes", "powerful build"],
+    "prompts": [
+      "a close-up photo of a {class_name} showing {attributes}",
+      "a {class_name} with {attributes} in the wild",
+      "a studio shot of a {class_name}, {attributes}"
+    ]
+  },
+  "red fox": {
+    "synonyms": ["vulpes vulpes", "rust-colored fox"],
+    "attributes": ["bushy tail", "pointed ears", "white muzzle"],
+    "prompts": [
+      "a close-up photo of a {class_name} showing {attributes}",
+      "a {class_name} with {attributes} standing in a forest",
+      "a studio shot of a {class_name}, {attributes}"
+    ]
+  },
+  "great horned owl": {
+    "synonyms": ["bubo virginianus", "horned owl"],
+    "attributes": ["tufted ears", "yellow eyes", "mottled feathers"],
+    "prompts": [
+      "a close-up photo of a {class_name} showing {attributes}",
+      "a {class_name} with {attributes} perched on a branch",
+      "a studio shot of a {class_name}, {attributes}"
+    ]
+  }
+}

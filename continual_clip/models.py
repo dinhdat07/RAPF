@@ -5,7 +5,6 @@ from itertools import chain
 import random
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
-
 from pyparsing import Any
 from omegaconf import DictConfig
 
@@ -68,6 +67,7 @@ class ClassIncrementalCLIP(nn.Module):
         self.class_ids_per_task = list(get_class_ids_per_task(cfg))
         self.total_class_names = []
         self.current_class_names = []
+        self.known_classes = 0
         self.text_tokens = None
         self.dtype = torch.float16 if cfg.fp16 else torch.float32
         self.adapter = nn.Linear(512, 512, bias=False, device=device)
@@ -95,6 +95,91 @@ class ClassIncrementalCLIP(nn.Module):
         self.nearest_class = None
         self.class_edge_distance = []
         self.mix_b = cfg.mix_bias
+
+    def update_stat(self, known_classes, total_classes, train_loader, device):
+        print("Updating stat...")
+        with torch.no_grad():
+            vecs = []
+            labels = []
+            for images, targets, _ in train_loader:
+                images, targets = images.to(device), targets.to(device)
+                image_features = self.encode_image(images).float()
+
+                # chuẩn hoá vector
+                image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+                vecs.append(image_features)
+                labels.append(targets)
+
+
+            if len(vecs) == 0:
+                print("WARNING: train_loader không có dữ liệu → skip update_stat")
+                return
+
+            vecs = torch.cat(vecs)
+            labels = torch.cat(labels)
+
+            print(f"[DEBUG update_stat] known_classes={known_classes}, total_classes={total_classes}")
+            print("Labels trong batch:", labels.unique().tolist())
+
+            # ---- Tính mean vector cho các lớp mới ----
+            mu_list = []
+            for i in range(known_classes, total_classes):
+                cls_vecs = vecs[labels == i]
+                if cls_vecs.numel() > 0:   # chỉ tính nếu có dữ liệu
+                    mu_list.append(cls_vecs.mean(dim=0, keepdim=True))
+
+            if len(mu_list) == 0:
+                print("WARNING: Không có class mới nào trong batch → skip update_stat")
+                return
+
+            mu = torch.cat(mu_list, dim=0)
+
+            # ---- Tính covariance ----
+            center_list = []
+            for j, i in enumerate(range(known_classes, total_classes)):
+                cls_vecs = vecs[labels == i]
+                if cls_vecs.numel() > 0:
+                    center_list.append(cls_vecs - mu[j])
+
+            if len(center_list) == 0:
+                print("WARNING: center_vecs rỗng → skip update_stat")
+                return
+
+            center_vecs = torch.cat(center_list, dim=0)
+
+            cov = center_vecs.T @ center_vecs / (center_vecs.shape[0] - 1)
+
+            # regularization để ổn định nghịch đảo
+            dim = center_vecs.shape[1]
+            reg = cov.trace() * torch.eye(dim, device=device)
+            cov_inv = dim * torch.linalg.pinv((center_vecs.shape[0] - 1) * cov + reg)
+
+            # ---- Update hoặc khởi tạo ----
+            if not hasattr(self, 'mu'):
+                self.mu = mu
+                self.cov_inv = cov_inv
+            else:
+                self.cov_inv = (
+                    (known_classes / total_classes) * self.cov_inv +
+                    (total_classes - known_classes) / total_classes * cov_inv +
+                    (
+                        (known_classes / total_classes) *
+                        (total_classes - known_classes) / (total_classes ** 2)
+                    ) * (
+                        (self.mu.mean(dim=0) - mu.mean(dim=0)).unsqueeze(1) @
+                        (self.mu.mean(dim=0) - mu.mean(dim=0)).unsqueeze(0)
+                    )
+                )
+                self.mu = torch.cat([self.mu, mu])
+
+            # prior đồng đều
+            ps = torch.ones(self.mu.shape[0], device=device) / self.mu.shape[0]
+
+            # ✅ Cập nhật lại weight & bias
+            self.W = torch.einsum('nd,dc->cn', self.mu, self.cov_inv)   # [num_classes, dim]
+            self.b = ps.log() - 0.5 * torch.einsum('nd,dc,nc->n', self.mu, self.cov_inv, self.mu)
+
     
 
     def get_trainable_parameters(self):
@@ -153,7 +238,7 @@ class ClassIncrementalCLIP(nn.Module):
 
     def adaptation(self, task_id, threshold=0):
         self.update_injection_units()
-        
+        self.known_classes = len(self.total_class_names)
         self.total_class_names += get_class_names(self.classes_names, self.class_ids_per_task[task_id])
         self.current_class_names = get_class_names(self.classes_names, self.class_ids_per_task[task_id])
         self.text_tokens = self.tokenize(
@@ -287,22 +372,20 @@ class ClassIncrementalCLIP(nn.Module):
                 seen.add(s); res.append(s)
         return res
 
-    def _get_text_des(self, dataname: str = 'cifar224') -> Dict[str, List[str]]:
-        path = Path("chat") / f"{dataname}_des.json"
-        if not path.is_file():
-            self.new_des_dict = {}
-            return self.new_des_dict
-
-        try:
-            with path.open("r", encoding="utf-8") as f:
-                raw = json.load(f)
-        except Exception:
-            self.new_des_dict = {}
-            return self.new_des_dict
-
-        new_des = {k: self._flatten_values(v) for k, v in raw.items()}
-        self.new_des_dict = new_des
-        return self.new_des_dict
+    def _get_text_des(self,dataname='cifar224'):
+        root_path = Path(__file__).resolve().parent.parent  # từ model/model.py lên root
+        des_path = root_path / "chat" / f"{dataname}_des.json"
+        with open(des_path, 'r') as f:
+            des_dict = json.load(f)
+        self.des_dict = des_dict
+        new_des_dict = {}
+        for key, value in des_dict.items():
+            new_key_value = []
+            for k, v in value.items():
+                new_key_value.extend(v)
+            new_des_dict[key] = new_key_value
+        self.new_des_dict = new_des_dict
+        return new_des_dict
     
     def _get_batch_des(self, des_file: Dict[str, List[str]], classnames: Iterable[str]) -> List[str]:
         out: List[str] = []
@@ -313,7 +396,69 @@ class ClassIncrementalCLIP(nn.Module):
             else:    
                 out.append(f"a photo of {cname}")
         return out
-            
+    
+    def rerank(self, des_dict, outputs, image_features_raw, class_to_label, device, topk=5):
+        with torch.no_grad():
+            batch_size = image_features_raw.shape[0]
+
+            topk_predict = outputs.topk(topk, dim=1)[1]  # (batch, topk)
+            topk_labels = [[class_to_label[int(label)] for label in pred] for pred in topk_predict]
+
+
+            # Khởi tạo logit tổng
+            logi_total = torch.zeros(batch_size, topk, dtype=image_features_raw.dtype, device=device)
+
+            for _ in range(3):  # trung bình 3 lần
+                texts = []
+                for b in range(batch_size):
+                    curr_texts = []
+                    for i, main_label in enumerate(topk_labels[b]):
+                        for j, second_label in enumerate(topk_labels[b]):
+                            if i == j:
+                                continue
+                            main_label_norm = main_label.replace("_", " ")
+                            second_label_norm = second_label.replace("_", " ")
+
+                            # fallback nếu nhãn không có trong des_dict
+                            if main_label_norm in des_dict and second_label_norm in des_dict[main_label_norm]:
+                                desc = random.choice(des_dict[main_label_norm][second_label_norm])
+                            elif main_label_norm in des_dict:
+                                desc = random.choice(random.choice(list(des_dict[main_label_norm].values())))
+                            else:
+                                desc = "description"
+                                print(f"[WARNING] Nhãn '{main_label_norm}' không có trong des_dict")    
+
+                            curr_texts.append(f"{main_label_norm} with {desc.lower()}")
+
+                    texts.extend(curr_texts)
+
+                # Encode text
+                texts_token = self.tokenize(texts).to(device)
+                texts_embed = self.encode_text(texts_token)
+
+                # Match dtype image_features
+                texts_embed = texts_embed.to(image_features_raw.dtype)
+
+                # Reshape: (batch, topk, topk-1, embed_dim)
+                texts_embed = texts_embed.reshape(batch_size, topk, topk-1, -1)
+                texts_embed = torch.mean(texts_embed, dim=2)  # (batch, topk, embed_dim)
+                texts_embed = texts_embed / texts_embed.norm(dim=-1, keepdim=True)
+
+                # Batch matrix multiplication
+                logits = torch.bmm(image_features_raw.unsqueeze(1), texts_embed.transpose(1,2)).squeeze(1)  # (batch, topk)
+                logi_total += logits
+
+            # Trung bình 3 lần
+            logits = logi_total / 3
+            logits = logits.to(outputs.dtype)
+
+            # Gán vào topk dự đoán
+            new_logits = torch.zeros_like(outputs)
+            for i in range(batch_size):
+                new_logits[i, topk_predict[i]] = logits[i]
+
+            return new_logits
+
 
 
 class DomainIncrementalCLIP(nn.Module):

@@ -1,7 +1,7 @@
-﻿
-import os
+﻿import os
 import json
 from pathlib import Path
+import torch
 import yaml
 
 from omegaconf import DictConfig, OmegaConf
@@ -42,7 +42,7 @@ def save_config(config: DictConfig) -> None:
 
 def get_workdir(path):
     split_path = list(Path(path).resolve().parts)
-    workdir_idx = split_path.index("RAPF")  
+    workdir_idx = split_path.index("rapf_engine")  # If a 'ValueError' occurs, replace 'rapf_engine' with your actual work directory
     return str(Path(*split_path[:workdir_idx+1]))
 
 def get_engine_descriptor_path(workdir: str, dataset_name: str) -> Optional[str]:
@@ -58,3 +58,43 @@ def get_engine_descriptor_path(workdir: str, dataset_name: str) -> Optional[str]
     candidate_path = os.path.normpath(os.path.join(workdir, candidate))
     return candidate_path if os.path.isfile(candidate_path) else None
 
+
+def engine_rerank(model, outputs, pre_image_feas, device, epoch, cfg):
+    """
+    Rerank batch outputs dựa trên GDA + knowledge injection.
+
+    Parameters:
+    - outputs: logits batch hiện tại (batch_size x num_classes)
+    - pre_image_feas: features batch hiện tại
+    - device: CPU/GPU
+    - epoch: epoch hiện tại
+    - cfg: config
+    """
+    model.eval()
+    with torch.no_grad():
+        if hasattr(cfg, "epochs") and epoch == cfg.epochs - 1:
+            # GDA classifier
+            outputs_gda = pre_image_feas @ model.W + model.b
+            outputs_gda = outputs_gda / outputs_gda.norm(dim=-1, keepdim=True)
+
+            # Rerank batch
+            outputs_rerank = model.rerank(
+                des_dict=model.des_dict,
+                outputs=outputs,
+                image_features_raw=pre_image_feas,
+                class_to_label=model.classes_names,
+                device=device,
+                topk=cfg.engine.topk
+            )
+
+            # Kết hợp GDA + rerank + original outputs
+            outputs = (
+                outputs_gda * cfg.engine.stat
+                + (cfg.engine.rerank * outputs_rerank
+                   + (1 - cfg.engine.rerank) * outputs) * (1 - cfg.engine.stat)
+            )
+        else:
+            # Nếu chưa đến tuned_epoch, trả về outputs bình thường
+            outputs = outputs
+
+    return outputs
