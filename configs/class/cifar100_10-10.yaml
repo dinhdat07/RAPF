@@ -28,7 +28,7 @@ dataset: "cifar100"
 # beta *len(list_for_one_batch) * batch_num_per_epoch(relevant to bz) * 10 approximates 2000 , number of samples generated per epoch
 num_workers: 16
 train_batch_size: 100
-epochs: 15
+epochs: 10
 lr: 0.001
 fp16: false
 seed: 2
@@ -48,8 +48,10 @@ engine:
   descriptor_json: "chat/cifar224_des.json"
   text_template: "a photo of a {}, detailed"
   num_prompts_cap: 8
-  lambda_img: 2.0
-  lambda_txt: 2.0
+  lambda_img: 0.5
+  lambda_txt: 0.5
   replay_alpha: 0.25
   sample_num: 0
+  "rerank": 0.5
+  "stat": 0.8
 
