@@ -8,7 +8,6 @@ from omegaconf import DictConfig, OmegaConf
 from typing import Optional
 
 
-
 def get_class_order(file_name: str) -> list:
     r"""TO BE DOCUMENTED"""
     with open(file_name, "r+") as f:
@@ -35,41 +34,18 @@ def save_config(config: DictConfig) -> None:
     OmegaConf.save(config, "config.yaml")
 
 
-# def get_workdir(path):
-#     split_path = path.split("/")
-#     workdir_idx = split_path.index("RAPF") # If a 'ValueError' occurs, replace 'RAPF' with your actual work directory
-#     return "/".join(split_path[:workdir_idx+1])
-
 def get_workdir(path):
     split_path = list(Path(path).resolve().parts)
-    workdir_idx = split_path.index("rapf_engine")  # If a 'ValueError' occurs, replace 'rapf_engine' with your actual work directory
+    candidates = ["RAPF", "rapf-engine"] # If a 'ValueError' occurs, replace 'rapf_engine' with your actual work directory
+    workdir_idx = next(
+        (i for i, part in enumerate(split_path) if part in candidates),
+        None
+    )
     return str(Path(*split_path[:workdir_idx+1]))
-
-def get_engine_descriptor_path(workdir: str, dataset_name: str) -> Optional[str]:
-    mapping = {
-        'cifar100': os.path.join('chat', 'cifar224_des.json'),
-        'imagenet_r': os.path.join('chat', 'imagenetr_des.json'),
-        'cub200': os.path.join('chat', 'cub_des.json'),
-    }
-    dataset_key = dataset_name.lower() if dataset_name else ''
-    candidate = mapping.get(dataset_key)
-    if not candidate:
-        return None
-    candidate_path = os.path.normpath(os.path.join(workdir, candidate))
-    return candidate_path if os.path.isfile(candidate_path) else None
 
 
 def engine_rerank(model, outputs, pre_image_feas, device, epoch, cfg):
-    """
-    Rerank batch outputs dựa trên GDA + knowledge injection.
 
-    Parameters:
-    - outputs: logits batch hiện tại (batch_size x num_classes)
-    - pre_image_feas: features batch hiện tại
-    - device: CPU/GPU
-    - epoch: epoch hiện tại
-    - cfg: config
-    """
     model.eval()
     with torch.no_grad():
         if hasattr(cfg, "epochs") and epoch == cfg.epochs - 1:
@@ -77,7 +53,7 @@ def engine_rerank(model, outputs, pre_image_feas, device, epoch, cfg):
             outputs_gda = pre_image_feas @ model.W + model.b
             outputs_gda = outputs_gda / outputs_gda.norm(dim=-1, keepdim=True)
 
-            # Rerank batch
+            # rerank batch
             outputs_rerank = model.rerank(
                 des_dict=model.des_dict,
                 outputs=outputs,
@@ -87,14 +63,14 @@ def engine_rerank(model, outputs, pre_image_feas, device, epoch, cfg):
                 topk=cfg.engine.topk
             )
 
-            # Kết hợp GDA + rerank + original outputs
+            # GDA + rerank + original outputs
             outputs = (
                 outputs_gda * cfg.engine.stat
                 + (cfg.engine.rerank * outputs_rerank
                    + (1 - cfg.engine.rerank) * outputs) * (1 - cfg.engine.stat)
             )
         else:
-            # Nếu chưa đến tuned_epoch, trả về outputs bình thường
+            # if not tuned_epoch, return normal outputs
             outputs = outputs
 
     return outputs
