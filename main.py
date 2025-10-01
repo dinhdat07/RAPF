@@ -1,5 +1,7 @@
 ﻿
 import os
+
+from continual_clip.utils import engine_rerank
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import json
 import pdb
@@ -61,7 +63,7 @@ def run_class_incremental(cfg, device):
         train_loader = DataLoader(train_dataset[task_id], batch_size=cfg.train_batch_size, shuffle=True, num_workers=cfg.num_workers)
         
         model.adaptation(task_id, threshold=cfg.threshold)
-        # model.update_stat(self._known_classes,self._total_classes, self.train_loader, self._device) ~ ENGINE
+        model.update_stat(known_classes=model.known_classes,total_classes=len(model.total_class_names),train_loader=train_loader,device=device) 
         model.train()
 
         rapf_params = list(model.adapter.parameters())
@@ -213,8 +215,17 @@ def run_class_incremental(cfg, device):
                     f"Li: {image_aug_loss.item():.4f} | Lt: {ref_text_loss.item():.4f} | Lh: {loss_hinge.item():.4f} | lrR: {rapf_lr:.4f} | lrE: {engine_lr:.4f}"
                 )
 
-                scheduler_rapf.step()
-                scheduler_engine.step()
+            scheduler_rapf.step()
+            scheduler_engine.step()
+
+            for inputs, targets, task_ids in train_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                with torch.no_grad():
+                    outputs, _ , _, _, _ = model(inputs)
+                    torch.nn.functional.softmax(outputs, dim=-1)
+                    metric_logger.add([outputs.cpu().argmax(dim=1), targets.cpu(), task_ids], subset="train")
+        
+        
         sample_loader = DataLoader(train_dataset[task_id], batch_size=128, shuffle=False, num_workers=cfg.num_workers)
         sample_data = []
         sample_target = []
@@ -239,21 +250,41 @@ def run_class_incremental(cfg, device):
             inputs, targets = inputs.to(device), targets.to(device)
             with torch.no_grad():
                 outputs, image_features, __, ___, pre_image_feas = model(inputs)
-                
-                # NEED TO IMPLEMENT THE ENGINE RERANKING FUNCTION!!!
-                # outputs = engine_rerank(image_features, outputs, model.total_class_names, text_prompt_bank, alpha=engine_alpha, topk=engine_rerank_topk)
+                outputs = engine_rerank(
+                    model=model,
+                    device=device,
+                    epoch=epochs - 1,
+                    cfg=cfg,
+                    outputs=outputs,
+                    pre_image_feas=pre_image_feas,
+                )
+                torch.nn.functional.softmax(outputs, dim=-1)
             metric_logger.add([outputs.cpu().argmax(dim=1), targets.cpu(), task_ids], subset="test")
 
-        acc_list.append(100 * metric_logger.accuracy)
+
+        # ----- test logging -----
+        test_acc = 100 * metric_logger.accuracy  # accuracy on test set
+        avg_acc = 100 * metric_logger.average_incremental_accuracy
+        forgetting_val = 100 * metric_logger.forgetting
+        acc_per_task = [round(100 * acc_t, 2) for acc_t in metric_logger.accuracy_per_task]
+        bwt = 100 * metric_logger.backward_transfer
+        fwt = 100 * metric_logger.forward_transfer
+
+        # ----- train logging -----
+        train_acc = 100 * metric_logger.online_accuracy if hasattr(metric_logger, "online_accuracy") else None
+        acc_list.append(test_acc)
+
+        # ----- logging -----
         with open(cfg.log_path, 'a+') as f:
             f.write(json.dumps({
                 'task': task_id,
-                'acc': round(100 * metric_logger.accuracy, 2),
-                'avg_acc': round(100 * metric_logger.average_incremental_accuracy, 2),
-                'forgetting': round(100 * metric_logger.forgetting, 6),
-                'acc_per_task': [round(100 * acc_t, 2) for acc_t in metric_logger.accuracy_per_task],
-                'bwt': round(100 * metric_logger.backward_transfer, 2),
-                'fwt': round(100 * metric_logger.forward_transfer, 2),
+                'train_acc': round(train_acc, 2) if train_acc is not None else None,
+                'test_acc': round(test_acc, 2),
+                'avg_acc': round(avg_acc, 2),
+                'forgetting': round(forgetting_val, 6),
+                'acc_per_task': acc_per_task,
+                'bwt': round(bwt, 2),
+                'fwt': round(fwt, 2),
             }) + '\n')
             metric_logger.end_task()
 
@@ -281,10 +312,9 @@ def continual_clip(cfg: DictConfig) -> None:
     if cfg.scenario == "class":
         run_class_incremental(cfg, device)
 
-
-
-
     
 
 if __name__ == "__main__":
     continual_clip()
+
+

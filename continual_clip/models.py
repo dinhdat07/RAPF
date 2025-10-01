@@ -5,7 +5,6 @@ from itertools import chain
 import random
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
-
 from pyparsing import Any
 from omegaconf import DictConfig
 
@@ -68,6 +67,7 @@ class ClassIncrementalCLIP(nn.Module):
         self.class_ids_per_task = list(get_class_ids_per_task(cfg))
         self.total_class_names = []
         self.current_class_names = []
+        self.known_classes = 0
         self.text_tokens = None
         self.dtype = torch.float16 if cfg.fp16 else torch.float32
         self.adapter = nn.Linear(512, 512, bias=False, device=device)
@@ -97,7 +97,7 @@ class ClassIncrementalCLIP(nn.Module):
         self.mix_b = cfg.mix_bias
 
     def update_stat(self, known_classes, total_classes, train_loader, device):
-        print("Updating stat...")
+        print("[INFO] Updating stat...")
         with torch.no_grad():
             vecs = []
             labels = []
@@ -105,7 +105,7 @@ class ClassIncrementalCLIP(nn.Module):
                 images, targets = images.to(device), targets.to(device)
                 image_features = self.encode_image(images).float()
 
-                # chuẩn hoá vector
+                # vector normalization
                 image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
                 vecs.append(image_features)
@@ -113,16 +113,16 @@ class ClassIncrementalCLIP(nn.Module):
 
 
             if len(vecs) == 0:
-                print("WARNING: train_loader không có dữ liệu → skip update_stat")
+                print("[WARNING] train_loader have no data, skip update_stat")
                 return
 
             vecs = torch.cat(vecs)
             labels = torch.cat(labels)
 
             print(f"[DEBUG update_stat] known_classes={known_classes}, total_classes={total_classes}")
-            print("Labels trong batch:", labels.unique().tolist())
+            print("Labels in batch:", labels.unique().tolist())
 
-            # ---- Tính mean vector cho các lớp mới ----
+            # ---- mean vector for new class----
             mu_list = []
             for i in range(known_classes, total_classes):
                 cls_vecs = vecs[labels == i]
@@ -135,7 +135,7 @@ class ClassIncrementalCLIP(nn.Module):
 
             mu = torch.cat(mu_list, dim=0)
 
-            # ---- Tính covariance ----
+            # ----covariance ----
             center_list = []
             for j, i in enumerate(range(known_classes, total_classes)):
                 cls_vecs = vecs[labels == i]
@@ -143,14 +143,14 @@ class ClassIncrementalCLIP(nn.Module):
                     center_list.append(cls_vecs - mu[j])
 
             if len(center_list) == 0:
-                print("WARNING: center_vecs rỗng → skip update_stat")
+                print("WARNING: center_vecs is empty, skip update_stat")
                 return
 
             center_vecs = torch.cat(center_list, dim=0)
 
             cov = center_vecs.T @ center_vecs / (center_vecs.shape[0] - 1)
 
-            # regularization để ổn định nghịch đảo
+            # regularization for stable inversion
             dim = center_vecs.shape[1]
             reg = cov.trace() * torch.eye(dim, device=device)
             cov_inv = dim * torch.linalg.pinv((center_vecs.shape[0] - 1) * cov + reg)
@@ -173,12 +173,13 @@ class ClassIncrementalCLIP(nn.Module):
                 )
                 self.mu = torch.cat([self.mu, mu])
 
-            # prior đồng đều
+            # equal prior
             ps = torch.ones(self.mu.shape[0], device=device) / self.mu.shape[0]
 
-            # ✅ Cập nhật lại weight & bias
+            # update weight & bias
             self.W = torch.einsum('nd,dc->cn', self.mu, self.cov_inv)   # [num_classes, dim]
             self.b = ps.log() - 0.5 * torch.einsum('nd,dc,nc->n', self.mu, self.cov_inv, self.mu)
+
     
 
     def get_trainable_parameters(self):
@@ -237,7 +238,7 @@ class ClassIncrementalCLIP(nn.Module):
 
     def adaptation(self, task_id, threshold=0):
         self.update_injection_units()
-        
+        self.known_classes = len(self.total_class_names)
         self.total_class_names += get_class_names(self.classes_names, self.class_ids_per_task[task_id])
         self.current_class_names = get_class_names(self.classes_names, self.class_ids_per_task[task_id])
         self.text_tokens = self.tokenize(
@@ -379,7 +380,6 @@ class ClassIncrementalCLIP(nn.Module):
                 out.append(f"a photo of {cname}")
         return out
     
-
     def rerank(self, des_dict, outputs, image_features_raw, class_to_label, device, topk=5):
         with torch.no_grad():
             batch_size = image_features_raw.shape[0]
@@ -387,8 +387,6 @@ class ClassIncrementalCLIP(nn.Module):
             topk_predict = outputs.topk(topk, dim=1)[1]  # (batch, topk)
             topk_labels = [[class_to_label[int(label)] for label in pred] for pred in topk_predict]
 
-
-            # init total logit
             logi_total = torch.zeros(batch_size, topk, dtype=image_features_raw.dtype, device=device)
 
             for _ in range(3):  # avg of 3 times
@@ -401,7 +399,7 @@ class ClassIncrementalCLIP(nn.Module):
                                 continue
                             main_label_norm = main_label.replace("_", " ")
                             second_label_norm = second_label.replace("_", " ")
-
+                            
                             # fallback 
                             if main_label_norm in des_dict and second_label_norm in des_dict[main_label_norm]:
                                 desc = random.choice(des_dict[main_label_norm][second_label_norm])
