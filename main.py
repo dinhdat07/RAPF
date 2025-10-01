@@ -52,9 +52,9 @@ def run_class_incremental(cfg, device):
     eval_dataset, classes_names = build_cl_scenarios(cfg, is_train=False, transforms=model.transforms)
     train_dataset, _ = build_cl_scenarios(cfg, is_train=True, transforms=model.transforms)
     model.classes_names = classes_names
-    model._get_text_des(dataname='cifar224') 
+    des_dict =  model._get_text_des(dataname='cifar224') 
     acc_list = []
-    metric_logger = Logger(list_subsets=["test"])
+    metric_logger = Logger(list_subsets=["train", "test"])
 
     for task_id, _ in enumerate(eval_dataset):
         logging.info(f"Train for task {task_id} has started.")
@@ -64,39 +64,53 @@ def run_class_incremental(cfg, device):
         # model.update_stat(self._known_classes,self._total_classes, self.train_loader, self._device) ~ ENGINE
         model.train()
 
-        trainable_params = list(model.get_trainable_parameters())
-        optimizer = torch.optim.AdamW(trainable_params, lr=cfg.lr, weight_decay=0.0)
-        milestones = cfg.milestones
+        rapf_params = list(model.adapter.parameters())
+        engine_params = list(model.image_injections[-1].parameters()) + list(model.text_injections[-1].parameters())
+        optimizer_rapf = torch.optim.Adam(rapf_params, lr=cfg.lr, weight_decay=0.0)
+        optimizer_engine = torch.optim.AdamW(engine_params, lr=cfg.lr, weight_decay=0.0)
+        milestones = getattr(cfg, 'milestones', [])
+        milestones = list(milestones) if milestones is not None else []
         epochs = cfg.epochs
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones, gamma=0.1, last_epoch=-1)
+        steps_per_epoch = max(len(train_loader), 1)
+        rapf_milestones = [int(m * steps_per_epoch) for m in milestones]
+        total_steps = epochs * steps_per_epoch
+        scheduler_rapf = torch.optim.lr_scheduler.MultiStepLR(
+            optimizer_rapf,
+            rapf_milestones,
+            gamma=0.1,
+            last_epoch=-1,
+        )
+        scheduler_engine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer_engine,
+            T_max=max(total_steps, 1),
+            last_epoch=-1,
+        )
 
         for i_epoch in range(epochs):
-            loss = torch.tensor(0.0).to(device)
-            loss_hinge = torch.tensor(0.0).to(device)
             tqdm_loader = tqdm(train_loader)
             if task_id>0:
                 random_class_order_list = list(range(cfg.initial_increment+(task_id-1)*cfg.increment))
                 random.shuffle(random_class_order_list)
-            
+
             batch_id = -1
             for inputs, targets, task_ids in tqdm_loader:
                 batch_id += 1
-                
+
                 inputs, targets = inputs.to(device), targets.to(device)
                 sg_inputs = None
                 edge_sample = None
                 if task_id > 0:
                     sg_inputs = []
                     sg_targets = []
-                    if cfg.dataset == "cifar100" and cfg.increment == 5:
+                    if cfg.dataset == 'cifar100' and cfg.increment == 5:
                         list_for_one_batch = [random_class_order_list[batch_id*4%len(random_class_order_list)], random_class_order_list[(batch_id*4+1)%len(random_class_order_list)], random_class_order_list[(batch_id*4+2)%len(random_class_order_list)], random_class_order_list[(batch_id*4+3)%len(random_class_order_list)]]
-                    elif cfg.dataset == "imagenet_R":
+                    elif cfg.dataset == 'imagenet_R':
                         list_for_one_batch = [random_class_order_list[batch_id*5%len(random_class_order_list)], random_class_order_list[(batch_id*5+1)%len(random_class_order_list)], random_class_order_list[(batch_id*5+2)%len(random_class_order_list)], random_class_order_list[(batch_id*5+3)%len(random_class_order_list)], random_class_order_list[(batch_id*5+4)%len(random_class_order_list)]]
-                    elif cfg.dataset == "cub200":
+                    elif cfg.dataset == 'cub200':
                         list_for_one_batch = [random_class_order_list[batch_id*10%len(random_class_order_list)], random_class_order_list[(batch_id*10+1)%len(random_class_order_list)], random_class_order_list[(batch_id*10+2)%len(random_class_order_list)], random_class_order_list[(batch_id*10+3)%len(random_class_order_list)], random_class_order_list[(batch_id*10+4)%len(random_class_order_list)], random_class_order_list[(batch_id*10+5)%len(random_class_order_list)], random_class_order_list[(batch_id*10+6)%len(random_class_order_list)], random_class_order_list[(batch_id*10+7)%len(random_class_order_list)], random_class_order_list[(batch_id*10+8)%len(random_class_order_list)], random_class_order_list[(batch_id*10+9)%len(random_class_order_list)]]
                     else:
                         list_for_one_batch = [random_class_order_list[batch_id*2%len(random_class_order_list)], random_class_order_list[(batch_id*2+1)%len(random_class_order_list)]]
-                    
+
                     if getattr(model, 'replay_sample_num', 0) > 0:
                         k = min(len(list_for_one_batch), model.replay_sample_num)
                         old_class = random.sample(list_for_one_batch, k)
@@ -131,20 +145,17 @@ def run_class_incremental(cfg, device):
 
 
                 outputs, _, __, edge_sample_features, pre_image_feas = model(inputs, memory_data=sg_inputs, not_ini=not_ini, edge_sample=edge_sample)
-                
-                # RAPF: calculate loss hinge
-                if task_id>0:
-                    if edge_sample is not None:
-                        edge_sample_features = edge_sample_features / edge_sample_features.norm(dim=-1, keepdim=True)
-                        edge_target_features = model.class_name_features[edge_p_target].type(edge_sample_features.dtype)
-                        edge_target_features = edge_target_features / edge_target_features.norm(dim=-1, keepdim=True)
-                        edge_nearest_class_features = model.class_name_features[edge_n_target].type(edge_sample_features.dtype)
-                        edge_nearest_class_features = edge_nearest_class_features / edge_nearest_class_features.norm(dim=-1, keepdim=True)
-                        loss_hinge = torch.relu(- (edge_sample_features * edge_target_features.clone().detach()).sum(-1) + (edge_sample_features * edge_nearest_class_features.clone().detach()).sum(-1) + 0.1).mean()
-                    else: 
-                        loss_hinge = 0
-                
-                # ENGINE: calculate aug-image contrastive loss
+
+                loss_hinge = torch.tensor(0.0, device=device)
+                if task_id>0 and edge_sample is not None:
+                    edge_sample_features = edge_sample_features / edge_sample_features.norm(dim=-1, keepdim=True)
+                    edge_target_features = model.class_name_features[edge_p_target].type(edge_sample_features.dtype)
+                    edge_target_features = edge_target_features / edge_target_features.norm(dim=-1, keepdim=True)
+                    edge_nearest_class_features = model.class_name_features[edge_n_target].type(edge_sample_features.dtype)
+                    edge_nearest_class_features = edge_nearest_class_features / edge_nearest_class_features.norm(dim=-1, keepdim=True)
+                    loss_hinge = torch.relu(- (edge_sample_features * edge_target_features.clone().detach()).sum(-1) + (edge_sample_features * edge_nearest_class_features.clone().detach()).sum(-1) + 0.1).mean()
+
+                image_aug_loss = torch.tensor(0.0, device=device)
                 if model.lambda_img > 0:
                     with torch.no_grad():
                         aug = torch.clamp(inputs + torch.randn_like(inputs) * 0.25, 0, 1)
@@ -153,7 +164,6 @@ def run_class_incremental(cfg, device):
                     sim_img = pre_image_feas[:aug_feas.shape[0]] @ aug_feas.T
                     image_aug_loss = contrastive_loss(sim_img)
 
-                # ENGINE: get text features by targets and calculate text-des loss
                 labels = [classes_names[int(y)] for y in targets.tolist()]
                 texts_clip=[model.prompt_template.format(inst) for inst in labels]
                 with torch.no_grad():  
@@ -162,6 +172,7 @@ def run_class_incremental(cfg, device):
                 clip_text_feas = model.apply_injections(model.text_injections, clip_text_feas)
                 clip_text_feas = clip_text_feas /clip_text_feas.norm(dim=-1, keepdim=True)
 
+                ref_text_loss = torch.tensor(0.0, device=device)
                 if model.lambda_txt > 0:
                     repeat_ = 1 
                     ref_text_loss_list = []
@@ -174,22 +185,36 @@ def run_class_incremental(cfg, device):
                         ref_text_features = ref_text_features / ref_text_features.norm(dim=-1, keepdim=True)
                         ref_text_loss_list.append(contrastive_loss(clip_text_feas @ ref_text_features.T))
                     ref_text_loss = sum(ref_text_loss_list) / len(ref_text_loss_list)
-                else:
-                    ref_text_loss = 0
 
-                # RAPF: calculate contrastive loss
                 loss_ce = F.cross_entropy(outputs, targets.detach())
-                
-                loss = loss_ce + model.lambda_img * image_aug_loss + model.lambda_txt * ref_text_loss + loss_hinge
-                loss.backward()
-                optimizer.step()
-                optimizer.zero_grad()
+
+                rapf_loss = loss_ce + loss_hinge
+                engine_loss = torch.tensor(0.0, device=device)
+                if model.lambda_img > 0:
+                    engine_loss = engine_loss + model.lambda_img * image_aug_loss
+                if model.lambda_txt > 0:
+                    engine_loss = engine_loss + model.lambda_txt * ref_text_loss
+                total_loss = rapf_loss + engine_loss
+
+                optimizer_rapf.zero_grad()
+                optimizer_engine.zero_grad()
+                engine_requires_grad = engine_loss.requires_grad
+                rapf_loss.backward(retain_graph=engine_requires_grad)
+                if engine_requires_grad:
+                    engine_loss.backward()
+                optimizer_rapf.step()
+                if engine_requires_grad:
+                    optimizer_engine.step()
+
+                rapf_lr = optimizer_rapf.param_groups[0]['lr']
+                engine_lr = optimizer_engine.param_groups[0]['lr']
                 tqdm_loader.set_description(
-                    f"Ep {i_epoch + 1}/{cfg.epochs} | L: {loss.item():.4f} | Lc: {loss_ce.item():.4f} | "
-                    f"Li: {image_aug_loss.item():.4f} | Lt: {ref_text_loss.item():.4f} | Lh: {loss_hinge.item():.4f} | lr: {scheduler.get_last_lr()[0]:.4f}"
+                    f"Ep {i_epoch + 1}/{cfg.epochs} | L: {total_loss.item():.4f} | Lc: {loss_ce.item():.4f} | "
+                    f"Li: {image_aug_loss.item():.4f} | Lt: {ref_text_loss.item():.4f} | Lh: {loss_hinge.item():.4f} | lrR: {rapf_lr:.4f} | lrE: {engine_lr:.4f}"
                 )
-            
-            scheduler.step()
+
+                scheduler_rapf.step()
+                scheduler_engine.step()
         sample_loader = DataLoader(train_dataset[task_id], batch_size=128, shuffle=False, num_workers=cfg.num_workers)
         sample_data = []
         sample_target = []

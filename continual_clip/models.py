@@ -95,6 +95,90 @@ class ClassIncrementalCLIP(nn.Module):
         self.nearest_class = None
         self.class_edge_distance = []
         self.mix_b = cfg.mix_bias
+
+    def update_stat(self, known_classes, total_classes, train_loader, device):
+        print("Updating stat...")
+        with torch.no_grad():
+            vecs = []
+            labels = []
+            for images, targets, _ in train_loader:
+                images, targets = images.to(device), targets.to(device)
+                image_features = self.encode_image(images).float()
+
+                # chuẩn hoá vector
+                image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+                vecs.append(image_features)
+                labels.append(targets)
+
+
+            if len(vecs) == 0:
+                print("WARNING: train_loader không có dữ liệu → skip update_stat")
+                return
+
+            vecs = torch.cat(vecs)
+            labels = torch.cat(labels)
+
+            print(f"[DEBUG update_stat] known_classes={known_classes}, total_classes={total_classes}")
+            print("Labels trong batch:", labels.unique().tolist())
+
+            # ---- Tính mean vector cho các lớp mới ----
+            mu_list = []
+            for i in range(known_classes, total_classes):
+                cls_vecs = vecs[labels == i]
+                if cls_vecs.numel() > 0:   # chỉ tính nếu có dữ liệu
+                    mu_list.append(cls_vecs.mean(dim=0, keepdim=True))
+
+            if len(mu_list) == 0:
+                print("WARNING: Không có class mới nào trong batch → skip update_stat")
+                return
+
+            mu = torch.cat(mu_list, dim=0)
+
+            # ---- Tính covariance ----
+            center_list = []
+            for j, i in enumerate(range(known_classes, total_classes)):
+                cls_vecs = vecs[labels == i]
+                if cls_vecs.numel() > 0:
+                    center_list.append(cls_vecs - mu[j])
+
+            if len(center_list) == 0:
+                print("WARNING: center_vecs rỗng → skip update_stat")
+                return
+
+            center_vecs = torch.cat(center_list, dim=0)
+
+            cov = center_vecs.T @ center_vecs / (center_vecs.shape[0] - 1)
+
+            # regularization để ổn định nghịch đảo
+            dim = center_vecs.shape[1]
+            reg = cov.trace() * torch.eye(dim, device=device)
+            cov_inv = dim * torch.linalg.pinv((center_vecs.shape[0] - 1) * cov + reg)
+
+            # ---- Update hoặc khởi tạo ----
+            if not hasattr(self, 'mu'):
+                self.mu = mu
+                self.cov_inv = cov_inv
+            else:
+                self.cov_inv = (
+                    (known_classes / total_classes) * self.cov_inv +
+                    (total_classes - known_classes) / total_classes * cov_inv +
+                    (
+                        (known_classes / total_classes) *
+                        (total_classes - known_classes) / (total_classes ** 2)
+                    ) * (
+                        (self.mu.mean(dim=0) - mu.mean(dim=0)).unsqueeze(1) @
+                        (self.mu.mean(dim=0) - mu.mean(dim=0)).unsqueeze(0)
+                    )
+                )
+                self.mu = torch.cat([self.mu, mu])
+
+            # prior đồng đều
+            ps = torch.ones(self.mu.shape[0], device=device) / self.mu.shape[0]
+
+            # ✅ Cập nhật lại weight & bias
+            self.W = torch.einsum('nd,dc->cn', self.mu, self.cov_inv)   # [num_classes, dim]
+            self.b = ps.log() - 0.5 * torch.einsum('nd,dc,nc->n', self.mu, self.cov_inv, self.mu)
     
 
     def get_trainable_parameters(self):
@@ -270,39 +354,20 @@ class ClassIncrementalCLIP(nn.Module):
             weight = U_old @ right
             self.adapter.weight.data = weight
 
-    def _flatten_values(value: Any) -> List[str]:
-        out: List[str] = []
-        def _walk(x: Any):
-            if isinstance(x, str):
-                s = x.strip()
-                if s: out.append(s)
-            elif isinstance(x, list):
-                for y in x: _walk(y)
-            elif isinstance(x, dict):
-                for y in x.values(): _walk(y)
-        _walk(value)
-        seen = set(); res = []
-        for s in out:
-            if s not in seen:
-                seen.add(s); res.append(s)
-        return res
-
-    def _get_text_des(self, dataname: str = 'cifar224') -> Dict[str, List[str]]:
-        path = Path("chat") / f"{dataname}_des.json"
-        if not path.is_file():
-            self.new_des_dict = {}
-            return self.new_des_dict
-
-        try:
-            with path.open("r", encoding="utf-8") as f:
-                raw = json.load(f)
-        except Exception:
-            self.new_des_dict = {}
-            return self.new_des_dict
-
-        new_des = {k: self._flatten_values(v) for k, v in raw.items()}
-        self.new_des_dict = new_des
-        return self.new_des_dict
+    def _get_text_des(self,dataname='cifar224'):
+        root_path = Path(__file__).resolve().parent.parent  # từ model/model.py lên root
+        des_path = root_path / "chat" / f"{dataname}_des.json"
+        with open(des_path, 'r') as f:
+            des_dict = json.load(f)
+        self.des_dict = des_dict
+        new_des_dict = {}
+        for key, value in des_dict.items():
+            new_key_value = []
+            for k, v in value.items():
+                new_key_value.extend(v)
+            new_des_dict[key] = new_key_value
+        self.new_des_dict = new_des_dict
+        return new_des_dict
     
     def _get_batch_des(self, des_file: Dict[str, List[str]], classnames: Iterable[str]) -> List[str]:
         out: List[str] = []
@@ -313,7 +378,69 @@ class ClassIncrementalCLIP(nn.Module):
             else:    
                 out.append(f"a photo of {cname}")
         return out
-            
+    
+
+    def rerank(self, des_dict, outputs, image_features_raw, class_to_label, device, topk=5):
+        with torch.no_grad():
+            batch_size = image_features_raw.shape[0]
+
+            topk_predict = outputs.topk(topk, dim=1)[1]  # (batch, topk)
+            topk_labels = [[class_to_label[int(label)] for label in pred] for pred in topk_predict]
+
+
+            # init total logit
+            logi_total = torch.zeros(batch_size, topk, dtype=image_features_raw.dtype, device=device)
+
+            for _ in range(3):  # avg of 3 times
+                texts = []
+                for b in range(batch_size):
+                    curr_texts = []
+                    for i, main_label in enumerate(topk_labels[b]):
+                        for j, second_label in enumerate(topk_labels[b]):
+                            if i == j:
+                                continue
+                            main_label_norm = main_label.replace("_", " ")
+                            second_label_norm = second_label.replace("_", " ")
+
+                            # fallback 
+                            if main_label_norm in des_dict and second_label_norm in des_dict[main_label_norm]:
+                                desc = random.choice(des_dict[main_label_norm][second_label_norm])
+                            elif main_label_norm in des_dict:
+                                desc = random.choice(random.choice(list(des_dict[main_label_norm].values())))
+                            else:
+                                desc = "description"
+                                print(f"[WARNING] '{main_label_norm}' label cannot be found in des_dict")    
+
+                            curr_texts.append(f"{main_label_norm} with {desc.lower()}")
+
+                    texts.extend(curr_texts)
+
+                # encode text
+                texts_token = self.tokenize(texts).to(device)
+                texts_embed = self.encode_text(texts_token)
+
+                # match dtype image_features
+                texts_embed = texts_embed.to(image_features_raw.dtype)
+
+                # reshape: (batch, topk, topk-1, embed_dim)
+                texts_embed = texts_embed.reshape(batch_size, topk, topk-1, -1)
+                texts_embed = torch.mean(texts_embed, dim=2)  # (batch, topk, embed_dim)
+                texts_embed = texts_embed / texts_embed.norm(dim=-1, keepdim=True)
+
+                # batch matrix multiplication
+                logits = torch.bmm(image_features_raw.unsqueeze(1), texts_embed.transpose(1,2)).squeeze(1)  # (batch, topk)
+                logi_total += logits
+
+            # avg logit
+            logits = logi_total / 3
+            logits = logits.to(outputs.dtype)
+
+            # topk re-rank
+            new_logits = torch.zeros_like(outputs)
+            for i in range(batch_size):
+                new_logits[i, topk_predict[i]] = logits[i]
+
+            return new_logits
 
 
 class DomainIncrementalCLIP(nn.Module):
