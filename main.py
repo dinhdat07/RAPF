@@ -56,37 +56,32 @@ def run_class_incremental(cfg, device):
     model.classes_names = classes_names
     des_dict =  model._get_text_des(dataname='cifar224') 
     acc_list = []
-    metric_logger = Logger(list_subsets=["train", "test"])
+    # metric_logger = Logger(list_subsets=["train", "test"])
+    metric_logger = Logger(list_subsets=["test"])
 
     for task_id, _ in enumerate(eval_dataset):
         logging.info(f"Train for task {task_id} has started.")
         train_loader = DataLoader(train_dataset[task_id], batch_size=cfg.train_batch_size, shuffle=True, num_workers=cfg.num_workers)
         
         model.adaptation(task_id, threshold=cfg.threshold)
-        model.update_stat(known_classes=model.known_classes,total_classes=len(model.total_class_names),train_loader=train_loader,device=device) 
+        model.update_stat(known_classes=model.known_classes, total_classes=len(model.total_class_names), train_loader=train_loader, device=device) 
         model.train()
 
         rapf_params = list(model.adapter.parameters())
         engine_params = list(model.image_injections[-1].parameters()) + list(model.text_injections[-1].parameters())
         optimizer_rapf = torch.optim.Adam(rapf_params, lr=cfg.lr, weight_decay=0.0)
-        optimizer_engine = torch.optim.AdamW(engine_params, lr=cfg.lr, weight_decay=0.0)
-        milestones = getattr(cfg, 'milestones', [])
-        milestones = list(milestones) if milestones is not None else []
+
+        if cfg.engine_optimizer == 'sgd':
+            optimizer_engine = torch.optim.SGD(engine_params, momentum=0.9, lr=cfg.engine.lr, weight_decay=cfg.engine.weight_decay)
+        elif cfg.engine_optimizer == 'adam': 
+            optimizer_engine = torch.optim.AdamW(engine_params, lr=cfg.engine.lr, weight_decay=cfg.engine.weight_decay)
+        
+
+        milestones = cfg.milestones
         epochs = cfg.epochs
-        steps_per_epoch = max(len(train_loader), 1)
-        rapf_milestones = [int(m * steps_per_epoch) for m in milestones]
-        total_steps = epochs * steps_per_epoch
-        scheduler_rapf = torch.optim.lr_scheduler.MultiStepLR(
-            optimizer_rapf,
-            rapf_milestones,
-            gamma=0.1,
-            last_epoch=-1,
-        )
-        scheduler_engine = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer_engine,
-            T_max=max(total_steps, 1),
-            last_epoch=-1,
-        )
+
+        scheduler_rapf = torch.optim.lr_scheduler.MultiStepLR(optimizer_rapf, milestones, gamma=0.1, last_epoch=-1)
+        scheduler_engine=torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_engine, T_max=cfg.epochs, eta_min=cfg.engine.min_lr)
 
         for i_epoch in range(epochs):
             tqdm_loader = tqdm(train_loader)
@@ -218,12 +213,12 @@ def run_class_incremental(cfg, device):
             scheduler_rapf.step()
             scheduler_engine.step()
 
-            for inputs, targets, task_ids in train_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
-                with torch.no_grad():
-                    outputs, _ , _, _, _ = model(inputs)
-                    torch.nn.functional.softmax(outputs, dim=-1)
-                    metric_logger.add([outputs.cpu().argmax(dim=1), targets.cpu(), task_ids], subset="train")
+            # for inputs, targets, task_ids in train_loader:
+            #     inputs, targets = inputs.to(device), targets.to(device)
+            #     with torch.no_grad():
+            #         outputs, _ , _, _, _ = model(inputs)
+            #         torch.nn.functional.softmax(outputs, dim=-1)
+            #         metric_logger.add([outputs.cpu().argmax(dim=1), targets.cpu(), task_ids], subset="train")
         
         
         sample_loader = DataLoader(train_dataset[task_id], batch_size=128, shuffle=False, num_workers=cfg.num_workers)
@@ -249,7 +244,7 @@ def run_class_incremental(cfg, device):
         for inputs, targets, task_ids in eval_loader:
             inputs, targets = inputs.to(device), targets.to(device)
             with torch.no_grad():
-                outputs, image_features, __, ___, pre_image_feas = model(inputs)
+                outputs, __, __, ___, pre_image_feas = model(inputs)
                 outputs = engine_rerank(
                     model=model,
                     device=device,

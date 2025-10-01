@@ -28,7 +28,7 @@ dataset: "cifar100"
 # beta *len(list_for_one_batch) * batch_num_per_epoch(relevant to bz) * 10 approximates 2000 , number of samples generated per epoch
 num_workers: 16
 train_batch_size: 100
-epochs: 10
+epochs: 15
 lr: 0.001
 fp16: false
 seed: 2
@@ -37,8 +37,9 @@ beta: 2
 mix_bias: 0.6
 threshold: 0.55
 shrinkage: false
+engine_optimizer: "sgd"
 
-engine:
+engine:  
   enable_otf: true
   otf_text: true
   otf_visual: true
@@ -49,9 +50,15 @@ engine:
   text_template: "a photo of a {}, detailed"
   num_prompts_cap: 8
   lambda_img: 0.5
-  lambda_txt: 0.5
+  lambda_txt: 2
   replay_alpha: 0.25
   sample_num: 0
-  "rerank": 0.5
-  "stat": 0.8
+  rerank: 0.5
+  stat: 0.8
+  lr: 0.05
+  weight_decay: 0.05
+  min_lr: 0
+  tuned_epoch: 15
+  
+
 
