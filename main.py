@@ -1,5 +1,4 @@
-﻿
-import os
+﻿import os
 
 from continual_clip.utils import engine_rerank
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
@@ -67,11 +66,13 @@ def run_class_incremental(cfg, device):
         model.train()
 
         trainable_params = list(model.get_trainable_parameters())
-        optimizer = torch.optim.AdamW(trainable_params, lr=cfg.lr, weight_decay=0.0)
+        optimizer = torch.optim.AdamW(trainable_params,momentum=0.9, lr=0.05, weight_decay=0.05)
         milestones = cfg.milestones
         epochs = cfg.epochs
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones, gamma=0.1, last_epoch=-1)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=0)
 
+        from continual_clip.losses import ClipLoss
+        cliploss=ClipLoss()
         for i_epoch in range(epochs):
             loss = torch.tensor(0.0).to(device)
             loss_hinge = torch.tensor(0.0).to(device)
@@ -132,7 +133,7 @@ def run_class_incremental(cfg, device):
                     not_ini = False
 
 
-                outputs, _, __, edge_sample_features, pre_image_feas = model(inputs, memory_data=sg_inputs, not_ini=not_ini, edge_sample=edge_sample)
+                outputs, final_image_feas, __, edge_sample_features, pre_image_feas = model(inputs, memory_data=sg_inputs, not_ini=not_ini, edge_sample=edge_sample)
                 
                 # RAPF: calculate loss hinge
                 if task_id>0:
@@ -179,15 +180,17 @@ def run_class_incremental(cfg, device):
                 else:
                     ref_text_loss = 0
 
+                clip_loss=cliploss(final_image_feas, clip_text_feas, model.logit_scale)
+
                 # RAPF: calculate contrastive loss
                 loss_ce = F.cross_entropy(outputs, targets.detach())
                 
-                loss = loss_ce + model.lambda_img * image_aug_loss + model.lambda_txt * ref_text_loss + loss_hinge
+                loss =  loss_ce + loss_hinge  + clip_loss + model.lambda_img * image_aug_loss + model.lambda_txt * ref_text_loss
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
                 tqdm_loader.set_description(
-                    f"Ep {i_epoch + 1}/{cfg.epochs} | L: {loss.item():.4f} | Lc: {loss_ce.item():.4f} | "
+                    f"Ep {i_epoch + 1}/{cfg.epochs} | L: {loss.item():.4f} | Clip_loss: {clip_loss.item():.4f} | Lc: {loss_ce.item():.4f} | "
                     f"Li: {image_aug_loss.item():.4f} | Lt: {ref_text_loss.item():.4f} | Lh: {loss_hinge.item():.4f} | lr: {scheduler.get_last_lr()[0]:.4f}"
                 )
             
