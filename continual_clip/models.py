@@ -183,7 +183,9 @@ class ClassIncrementalCLIP(nn.Module):
     
 
     def get_trainable_parameters(self):
-        params = [self.adapter.parameters()]
+        # params = [self.adapter.parameters()]
+
+        params = []
         if len(self.image_injections) > 0:
             params.append(self.image_injections[-1].parameters())
         if len(self.text_injections) > 0:
@@ -268,8 +270,10 @@ class ClassIncrementalCLIP(nn.Module):
         # --------- image features ---------
         image = image.type(self.dtype)
         with torch.no_grad():
-            image_features = self.encode_image(image).float()
-            original_image_features = image_features.clone()
+            clip_features = self.encode_image(image).float()
+        raw_image_features = clip_features / clip_features.norm(dim=-1, keepdim=True)
+        original_image_features = raw_image_features.clone()
+        image_features = clip_features
 
         # concat memory data and apply injection 
         image_features = self.apply_injections(self.image_injections, image_features)
@@ -292,7 +296,9 @@ class ClassIncrementalCLIP(nn.Module):
             pre_adapter = torch.cat([pre_adapter, edge_sample], dim=0)
 
         # RAPF: apply adapter
-        final_image_feas = self.adapter(pre_adapter.type(self.dtype).detach()).type(self.clip_type)
+        # final_image_feas = self.adapter(pre_adapter.type(self.dtype).detach()).type(self.clip_type)
+
+        final_image_feas = pre_adapter
         final_image_feas = final_image_feas / final_image_feas.norm(dim=1, keepdim=True)
 
         edge_sample_features = None
@@ -318,14 +324,14 @@ class ClassIncrementalCLIP(nn.Module):
                 old_memory_feature = self.old_adapter(memory_data)
                 old_memory_feature = old_memory_feature / old_memory_feature.norm(dim=1, keepdim=True)
             if edge_sample is not None:
-                return probs, final_image_feas, old_memory_feature, edge_sample_features, img_feas
-            return probs, final_image_feas, old_memory_feature, final_text_feas, img_feas
+                return probs, final_image_feas, old_memory_feature, edge_sample_features, img_feas, raw_image_features
+            return probs, final_image_feas, old_memory_feature, final_text_feas, img_feas, raw_image_features
         if ori_ima_f:
             if memory_data is not None:
                 final_image_feas = final_image_feas[:-memory_data.shape[0]]
-            return probs, original_image_features, final_image_feas
+            return probs, original_image_features, final_image_feas, None, None, raw_image_features
         
-        return probs, final_image_feas, None, edge_sample_features, img_feas
+        return probs, final_image_feas, None, edge_sample_features, img_feas, raw_image_features
 
     def analyze_mean_cov(self, features, labels):
         label = torch.sort(torch.unique(labels))[0]
@@ -397,12 +403,12 @@ class ClassIncrementalCLIP(nn.Module):
                 out.append(f"a photo of {cname}")
         return out
     
-    def rerank(self, des_dict, outputs, image_features_raw, class_to_label, device, topk=5):
+    def rerank(self, des_dict, outputs, image_features_raw, class_names, device, topk=5):
         with torch.no_grad():
             batch_size = image_features_raw.shape[0]
 
             topk_predict = outputs.topk(topk, dim=1)[1]  # (batch, topk)
-            topk_labels = [[class_to_label[int(label)] for label in pred] for pred in topk_predict]
+            topk_labels = [[class_names[int(label)] for label in pred] for pred in topk_predict]
 
 
             # Khởi tạo logit tổng

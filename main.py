@@ -47,8 +47,6 @@ def run_class_incremental(cfg, device):
     
     # model = load_model(cfg, device)
     model = ClassIncrementalCLIP(cfg, device)
-    engine_alpha = 0.8
-    engine_rerank_topk = 5
 
     eval_dataset, classes_names = build_cl_scenarios(cfg, is_train=False, transforms=model.transforms)
     train_dataset, _ = build_cl_scenarios(cfg, is_train=True, transforms=model.transforms)
@@ -66,7 +64,7 @@ def run_class_incremental(cfg, device):
         model.train()
 
         trainable_params = list(model.get_trainable_parameters())
-        optimizer = torch.optim.AdamW(trainable_params,momentum=0.9, lr=0.05, weight_decay=0.05)
+        optimizer = torch.optim.SGD(trainable_params, momentum=0.9, lr=0.05, weight_decay=0.05)
         milestones = cfg.milestones
         epochs = cfg.epochs
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=0)
@@ -133,19 +131,19 @@ def run_class_incremental(cfg, device):
                     not_ini = False
 
 
-                outputs, final_image_feas, __, edge_sample_features, pre_image_feas = model(inputs, memory_data=sg_inputs, not_ini=not_ini, edge_sample=edge_sample)
+                outputs, final_image_feas, __, edge_sample_features, pre_image_feas, _raw_image_feas = model(inputs, memory_data=sg_inputs, not_ini=not_ini, edge_sample=edge_sample)
                 
                 # RAPF: calculate loss hinge
-                if task_id>0:
-                    if edge_sample is not None:
-                        edge_sample_features = edge_sample_features / edge_sample_features.norm(dim=-1, keepdim=True)
-                        edge_target_features = model.class_name_features[edge_p_target].type(edge_sample_features.dtype)
-                        edge_target_features = edge_target_features / edge_target_features.norm(dim=-1, keepdim=True)
-                        edge_nearest_class_features = model.class_name_features[edge_n_target].type(edge_sample_features.dtype)
-                        edge_nearest_class_features = edge_nearest_class_features / edge_nearest_class_features.norm(dim=-1, keepdim=True)
-                        loss_hinge = torch.relu(- (edge_sample_features * edge_target_features.clone().detach()).sum(-1) + (edge_sample_features * edge_nearest_class_features.clone().detach()).sum(-1) + 0.1).mean()
-                    else: 
-                        loss_hinge = 0
+                # if task_id>0:
+                #     if edge_sample is not None:
+                #         edge_sample_features = edge_sample_features / edge_sample_features.norm(dim=-1, keepdim=True)
+                #         edge_target_features = model.class_name_features[edge_p_target].type(edge_sample_features.dtype)
+                #         edge_target_features = edge_target_features / edge_target_features.norm(dim=-1, keepdim=True)
+                #         edge_nearest_class_features = model.class_name_features[edge_n_target].type(edge_sample_features.dtype)
+                #         edge_nearest_class_features = edge_nearest_class_features / edge_nearest_class_features.norm(dim=-1, keepdim=True)
+                #         loss_hinge = torch.relu(- (edge_sample_features * edge_target_features.clone().detach()).sum(-1) + (edge_sample_features * edge_nearest_class_features.clone().detach()).sum(-1) + 0.1).mean()
+                #     else: 
+                #         loss_hinge = 0
                 
                 # ENGINE: calculate aug-image contrastive loss
                 if model.lambda_img > 0:
@@ -157,7 +155,7 @@ def run_class_incremental(cfg, device):
                     image_aug_loss = contrastive_loss(sim_img)
 
                 # ENGINE: get text features by targets and calculate text-des loss
-                labels = [classes_names[int(y)] for y in targets.tolist()]
+                labels = [model.total_class_names[int(y)] for y in targets.tolist()]
                 texts_clip=[model.prompt_template.format(inst) for inst in labels]
                 with torch.no_grad():  
                     clip_tokens = model.tokenize(texts_clip).to(model.device)
@@ -183,14 +181,16 @@ def run_class_incremental(cfg, device):
                 clip_loss=cliploss(final_image_feas, clip_text_feas, model.logit_scale)
 
                 # RAPF: calculate contrastive loss
-                loss_ce = F.cross_entropy(outputs, targets.detach())
+                # loss_ce = F.cross_entropy(outputs, targets.detach())
                 
-                loss =  loss_ce + loss_hinge  + clip_loss + model.lambda_img * image_aug_loss + model.lambda_txt * ref_text_loss
+                # loss =  loss_ce + loss_hinge  + clip_loss + model.lambda_img * image_aug_loss + model.lambda_txt * ref_text_loss
+
+                loss = clip_loss + model.lambda_img * image_aug_loss + model.lambda_txt * ref_text_loss
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
                 tqdm_loader.set_description(
-                    f"Ep {i_epoch + 1}/{cfg.epochs} | L: {loss.item():.4f} | Clip_loss: {clip_loss.item():.4f} | Lc: {loss_ce.item():.4f} | "
+                    f"Ep {i_epoch + 1}/{cfg.epochs} | L: {loss.item():.4f} | Clip_loss: {clip_loss.item():.4f} | "
                     f"Li: {image_aug_loss.item():.4f} | Lt: {ref_text_loss.item():.4f} | Lh: {loss_hinge.item():.4f} | lr: {scheduler.get_last_lr()[0]:.4f}"
                 )
             
@@ -198,7 +198,7 @@ def run_class_incremental(cfg, device):
             for inputs, targets, task_ids in train_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
                 with torch.no_grad():
-                    outputs, _ , _, _, _ = model(inputs)
+                    outputs, *_ = model(inputs)
                     torch.nn.functional.softmax(outputs, dim=-1)
                     metric_logger.add([outputs.cpu().argmax(dim=1), targets.cpu(), task_ids], subset="train")
         
@@ -211,7 +211,7 @@ def run_class_incremental(cfg, device):
         for input, target, task_ids in tqdm(sample_loader):
             input, target = input.to(device), target.to(device)
             with torch.no_grad():
-                _, ori_ima_feat, after_adapt_feature = model(input, ori_ima_f=True)
+                _, ori_ima_feat, after_adapt_feature, *_ = model(input, ori_ima_f=True)
             sample_data.append(ori_ima_feat)
             sample_target.append(target)
             sample_after_adapt_feature.append(after_adapt_feature)
@@ -226,14 +226,14 @@ def run_class_incremental(cfg, device):
         for inputs, targets, task_ids in eval_loader:
             inputs, targets = inputs.to(device), targets.to(device)
             with torch.no_grad():
-                outputs, image_features, __, ___, pre_image_feas = model(inputs)
+                outputs, _, __, ___, _pre_image_feas, raw_image_feas = model(inputs)
                 outputs = engine_rerank(
                     model=model,
                     device=device,
                     epoch=epochs - 1,
                     cfg=cfg,
                     outputs=outputs,
-                    pre_image_feas=pre_image_feas,
+                    raw_image_feas=raw_image_feas,
                 )
                 torch.nn.functional.softmax(outputs, dim=-1)
             metric_logger.add([outputs.cpu().argmax(dim=1), targets.cpu(), task_ids], subset="test")

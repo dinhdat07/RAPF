@@ -42,7 +42,11 @@ def save_config(config: DictConfig) -> None:
 
 def get_workdir(path):
     split_path = list(Path(path).resolve().parts)
-    workdir_idx = split_path.index("rapf_engine")  # If a 'ValueError' occurs, replace 'rapf_engine' with your actual work directory
+    candidates = ["RAPF", "rapf-engine"] # If a 'ValueError' occurs, replace 'rapf_engine' with your actual work directory
+    workdir_idx = next(
+        (i for i, part in enumerate(split_path) if part in candidates),
+        None
+    )
     return str(Path(*split_path[:workdir_idx+1]))
 
 def get_engine_descriptor_path(workdir: str, dataset_name: str) -> Optional[str]:
@@ -59,13 +63,13 @@ def get_engine_descriptor_path(workdir: str, dataset_name: str) -> Optional[str]
     return candidate_path if os.path.isfile(candidate_path) else None
 
 
-def engine_rerank(model, outputs, pre_image_feas, device, epoch, cfg):
+def engine_rerank(model, outputs, raw_image_feas, device, epoch, cfg):
     """
     Rerank batch outputs dựa trên GDA + knowledge injection.
 
     Parameters:
     - outputs: logits batch hiện tại (batch_size x num_classes)
-    - pre_image_feas: features batch hiện tại
+    - raw_image_feas: đặc trưng ảnh từ backbone CLIP (chưa qua injection)
     - device: CPU/GPU
     - epoch: epoch hiện tại
     - cfg: config
@@ -74,15 +78,15 @@ def engine_rerank(model, outputs, pre_image_feas, device, epoch, cfg):
     with torch.no_grad():
         if hasattr(cfg, "epochs") and epoch == cfg.epochs - 1:
             # GDA classifier
-            outputs_gda = pre_image_feas @ model.W + model.b
+            outputs_gda = raw_image_feas @ model.W + model.b
             outputs_gda = outputs_gda / outputs_gda.norm(dim=-1, keepdim=True)
 
             # Rerank batch
             outputs_rerank = model.rerank(
                 des_dict=model.des_dict,
                 outputs=outputs,
-                image_features_raw=pre_image_feas,
-                class_to_label=model.classes_names,
+                image_features_raw=raw_image_feas,
+                class_names=model.total_class_names,
                 device=device,
                 topk=cfg.engine.topk
             )

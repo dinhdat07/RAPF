@@ -52,6 +52,6 @@ engine:
   lambda_txt: 0.5
   replay_alpha: 0.25
   sample_num: 0
-  "rerank": 0.5
-  "stat": 0.8
+  rerank: 0.5
+  stat: 0.8
 
