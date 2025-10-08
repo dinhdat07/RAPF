@@ -83,6 +83,7 @@ class ClassIncrementalCLIP(nn.Module):
         self.image_injections = nn.ModuleList()
         self.text_injections = nn.ModuleList()
         self.new_des_dict = {}
+        self.prototype: List[torch.Tensor] = []
 
         # old adapter
         self.old_adapter = None
@@ -95,6 +96,7 @@ class ClassIncrementalCLIP(nn.Module):
         self.nearest_class = None
         self.class_edge_distance = []
         self.mix_b = cfg.mix_bias
+        self.sample_noise = float(getattr(self.engine_cfg, 'sample_noise', 0.25)) if self.engine_cfg else 0.25
 
     def update_stat(self, known_classes, total_classes, train_loader, device):
         print("Updating stat...")
@@ -124,10 +126,11 @@ class ClassIncrementalCLIP(nn.Module):
 
             # ---- Tính mean vector cho các lớp mới ----
             mu_list = []
-            for i in range(known_classes, total_classes):
-                cls_vecs = vecs[labels == i]
+            for class_idx in range(known_classes, total_classes):
+                cls_vecs = vecs[labels == class_idx]
                 if cls_vecs.numel() > 0:   # chỉ tính nếu có dữ liệu
-                    mu_list.append(cls_vecs.mean(dim=0, keepdim=True))
+                    mean_vec = cls_vecs.mean(dim=0, keepdim=True)
+                    mu_list.append(mean_vec)
 
             if len(mu_list) == 0:
                 print("WARNING: Không có class mới nào trong batch → skip update_stat")
@@ -272,7 +275,7 @@ class ClassIncrementalCLIP(nn.Module):
         with torch.no_grad():
             clip_features = self.encode_image(image).float()
         raw_image_features = clip_features / clip_features.norm(dim=-1, keepdim=True)
-        original_image_features = raw_image_features.clone()
+        original_image_features = clip_features.clone()
         image_features = clip_features
 
         # concat memory data and apply injection 
@@ -340,6 +343,12 @@ class ClassIncrementalCLIP(nn.Module):
             index = index.squeeze()
             class_data = features[index]
             mean = class_data.mean(dim=0)
+            proto = mean.detach().to(torch.float32)
+            class_idx = int(l.item()) if hasattr(l, "item") else int(l)
+            if len(self.prototype) <= class_idx:
+                self.prototype.append(proto)
+            else:
+                self.prototype[class_idx] = proto
             cov = torch.cov(class_data.t()) + 1e-4 * torch.eye(class_data.shape[-1], device=class_data.device)
             distance = torch.cdist(class_data, mean.unsqueeze(0)).squeeze()
             max_distance = torch.sort(distance)[0][-10:]

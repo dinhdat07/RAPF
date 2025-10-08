@@ -89,7 +89,9 @@ def run_class_incremental(cfg, device):
                 if task_id > 0:
                     sg_inputs = []
                     sg_targets = []
-                    if cfg.dataset == "cifar100" and cfg.increment == 5:
+                    if model.engine_cfg is not None:
+                        list_for_one_batch = random_class_order_list.copy()
+                    elif cfg.dataset == "cifar100" and cfg.increment == 5:
                         list_for_one_batch = [random_class_order_list[batch_id*4%len(random_class_order_list)], random_class_order_list[(batch_id*4+1)%len(random_class_order_list)], random_class_order_list[(batch_id*4+2)%len(random_class_order_list)], random_class_order_list[(batch_id*4+3)%len(random_class_order_list)]]
                     elif cfg.dataset == "imagenet_R":
                         list_for_one_batch = [random_class_order_list[batch_id*5%len(random_class_order_list)], random_class_order_list[(batch_id*5+1)%len(random_class_order_list)], random_class_order_list[(batch_id*5+2)%len(random_class_order_list)], random_class_order_list[(batch_id*5+3)%len(random_class_order_list)], random_class_order_list[(batch_id*5+4)%len(random_class_order_list)]]
@@ -105,14 +107,19 @@ def run_class_incremental(cfg, device):
                         old_class = list_for_one_batch
 
                     for i in old_class:
-                        # use cov,mean and shrinkage instead of sample noise like ENGINE
-                        proto = sample(model.class_mean_list[i], model.class_cov_list[i], int(10*cfg.beta), shrink=cfg.shrinkage)
-                        sg_inputs.append(proto)
-                        # int(10*cfg.beta) instead of int(1) like ENGINE
-                        sg_targets.append(torch.ones(int(10*cfg.beta), dtype=torch.long, device=device)*i)
-                    sg_inputs = torch.cat(sg_inputs, dim=0)
-                    sg_targets = torch.cat(sg_targets, dim=0)
-                    targets = torch.cat([targets, sg_targets], dim=0)
+                        if i >= len(model.prototype):
+                            continue
+                        proto = model.prototype[i].to(device).clone()
+                        if model.sample_noise > 0:
+                            proto = proto + torch.randn_like(proto) * model.sample_noise
+                        sg_inputs.append(proto.unsqueeze(0))
+                        sg_targets.append(torch.ones(1, dtype=torch.long, device=device) * i)
+                    if sg_inputs:
+                        sg_inputs = torch.cat(sg_inputs, dim=0)
+                        sg_targets = torch.cat(sg_targets, dim=0)
+                        targets = torch.cat([targets, sg_targets], dim=0)
+                    else:
+                        sg_inputs = None
 
                 if model.hard_pairs is not None and model.hard_pairs.shape[0] > 0:
                     edge_sample = []
