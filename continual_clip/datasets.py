@@ -11,6 +11,7 @@ from continuum.datasets import (
 from .utils import get_dataset_class_names, get_workdir
 
 from torchvision import transforms
+from torchvision.transforms import InterpolationMode
 
 
 class ImageNet1000(ImageFolderDataset):
@@ -115,16 +116,37 @@ def get_dataset(cfg, is_train, transforms=None):
     return dataset, classes_names
 
 
-def build_cl_scenarios(cfg, is_train, transforms) -> nn.Module:
+def _build_engine_transform(cfg, base_transforms):
+    dataset_name = cfg.dataset.lower() if hasattr(cfg, "dataset") else ""
+
+    if dataset_name.startswith("cifar"):
+        print("Using CIFAR-100 ENGINE-style transforms")
+        clip_mean = (0.48145466, 0.4578275, 0.40821073)
+        clip_std = (0.26862954, 0.26130258, 0.27577711)
+        transform_list = [
+            transforms.Resize((224, 224), interpolation=InterpolationMode.BICUBIC),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=clip_mean, std=clip_std),
+        ]
+        return transforms.Compose(transform_list)
+
+    # fall back to original transforms
+    return base_transforms
+
+
+def build_cl_scenarios(cfg, is_train, base_transforms) -> nn.Module:
 
     dataset, classes_names = get_dataset(cfg, is_train)
-    # pdb.set_trace()
+
+    transforms_to_use = _build_engine_transform(cfg, base_transforms)
+
     if cfg.scenario == "class":
         scenario = ClassIncremental(
             dataset,
             initial_increment=cfg.initial_increment,
             increment=cfg.increment,
-            transformations=transforms.transforms, # Convert Compose into list
+            transformations=transforms_to_use.transforms if hasattr(transforms_to_use, "transforms") else transforms_to_use,
             class_order=cfg.class_order,
         )
 

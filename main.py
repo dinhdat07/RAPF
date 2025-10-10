@@ -48,8 +48,8 @@ def run_class_incremental(cfg, device):
     # model = load_model(cfg, device)
     model = ClassIncrementalCLIP(cfg, device)
 
-    eval_dataset, classes_names = build_cl_scenarios(cfg, is_train=False, transforms=model.transforms)
-    train_dataset, _ = build_cl_scenarios(cfg, is_train=True, transforms=model.transforms)
+    eval_dataset, classes_names = build_cl_scenarios(cfg, is_train=False, base_transforms=model.transforms)
+    train_dataset, _ = build_cl_scenarios(cfg, is_train=True, base_transforms=model.transforms)
     model.classes_names = classes_names
     des_dict =  model._get_text_des(dataname='cifar224') 
     acc_list = []
@@ -89,16 +89,14 @@ def run_class_incremental(cfg, device):
                 if task_id > 0:
                     sg_inputs = []
                     sg_targets = []
-                    if model.engine_cfg is not None:
-                        list_for_one_batch = random_class_order_list.copy()
-                    elif cfg.dataset == "cifar100" and cfg.increment == 5:
+                    if cfg.dataset == "cifar100" and cfg.increment == 5:
                         list_for_one_batch = [random_class_order_list[batch_id*4%len(random_class_order_list)], random_class_order_list[(batch_id*4+1)%len(random_class_order_list)], random_class_order_list[(batch_id*4+2)%len(random_class_order_list)], random_class_order_list[(batch_id*4+3)%len(random_class_order_list)]]
                     elif cfg.dataset == "imagenet_R":
                         list_for_one_batch = [random_class_order_list[batch_id*5%len(random_class_order_list)], random_class_order_list[(batch_id*5+1)%len(random_class_order_list)], random_class_order_list[(batch_id*5+2)%len(random_class_order_list)], random_class_order_list[(batch_id*5+3)%len(random_class_order_list)], random_class_order_list[(batch_id*5+4)%len(random_class_order_list)]]
                     elif cfg.dataset == "cub200":
                         list_for_one_batch = [random_class_order_list[batch_id*10%len(random_class_order_list)], random_class_order_list[(batch_id*10+1)%len(random_class_order_list)], random_class_order_list[(batch_id*10+2)%len(random_class_order_list)], random_class_order_list[(batch_id*10+3)%len(random_class_order_list)], random_class_order_list[(batch_id*10+4)%len(random_class_order_list)], random_class_order_list[(batch_id*10+5)%len(random_class_order_list)], random_class_order_list[(batch_id*10+6)%len(random_class_order_list)], random_class_order_list[(batch_id*10+7)%len(random_class_order_list)], random_class_order_list[(batch_id*10+8)%len(random_class_order_list)], random_class_order_list[(batch_id*10+9)%len(random_class_order_list)]]
                     else:
-                        list_for_one_batch = [random_class_order_list[batch_id*2%len(random_class_order_list)], random_class_order_list[(batch_id*2+1)%len(random_class_order_list)]]
+                        list_for_one_batch = random_class_order_list.copy()
                     
                     if getattr(model, 'replay_sample_num', 0) > 0:
                         k = min(len(list_for_one_batch), model.replay_sample_num)
