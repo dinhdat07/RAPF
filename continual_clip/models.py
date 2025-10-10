@@ -8,7 +8,7 @@ from typing import Dict, Iterable, List, Optional
 from pyparsing import Any
 from omegaconf import DictConfig
 
-import clip
+import open_clip
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -55,13 +55,24 @@ class ClassIncrementalCLIP(nn.Module):
         self.prompt_template = cfg.prompt_template
         self.device = device
         self.classes_names = None
-        model, self.transforms = clip.load(cfg.model_name, device=device, jit=jit)
+
+        model_name_cfg = getattr(cfg, "model_name", "ViT-B-16")
+        model_name = model_name_cfg.replace("/", "-")
+        pretrained = getattr(cfg, "openclip_pretrained", "laion400m_e32")
+        model, preprocess_train, preprocess_val = open_clip.create_model_and_transforms(
+            model_name,
+            pretrained=pretrained,
+            device=device,
+            jit=jit,
+        )
+        self.transforms = preprocess_train if preprocess_train is not None else preprocess_val
+        self.model = model
         self.visual = model.visual
-        self.transformer = model.transformer
-        self.positional_embedding = model.positional_embedding
-        self.token_embedding = model.token_embedding
-        self.ln_final = model.ln_final
-        self.text_projection = model.text_projection
+        self.transformer = getattr(model, "transformer", None)
+        self.positional_embedding = getattr(model, "positional_embedding", None)
+        self.token_embedding = getattr(model, "token_embedding", None)
+        self.ln_final = getattr(model, "ln_final", None)
+        self.text_projection = getattr(model, "text_projection", None)
         self.logit_scale = model.logit_scale
 
         self.class_ids_per_task = list(get_class_ids_per_task(cfg))
@@ -71,8 +82,9 @@ class ClassIncrementalCLIP(nn.Module):
         self.text_tokens = None
         self.dtype = torch.float16 if cfg.fp16 else torch.float32
         self.adapter = nn.Linear(512, 512, bias=False, device=device)
-        self.clip_type = model.dtype
-        self.tokenize = clip.tokenize
+        self.clip_type = next(model.parameters()).dtype
+        self.tokenizer = open_clip.get_tokenizer(model_name)
+        self.tokenize = self.tokenizer
 
         # ENGINE
         self.engine_cfg = getattr(cfg, 'engine', None)
@@ -107,7 +119,7 @@ class ClassIncrementalCLIP(nn.Module):
                 images, targets = images.to(device), targets.to(device)
                 image_features = self.encode_image(images).float()
 
-                # chuẩn hoá vector
+                # normalize vector
                 image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
                 vecs.append(image_features)
@@ -115,30 +127,30 @@ class ClassIncrementalCLIP(nn.Module):
 
 
             if len(vecs) == 0:
-                print("WARNING: train_loader không có dữ liệu → skip update_stat")
+                print("WARNING: train_loader has no data → skip update_stat")
                 return
 
             vecs = torch.cat(vecs)
             labels = torch.cat(labels)
 
             print(f"[DEBUG update_stat] known_classes={known_classes}, total_classes={total_classes}")
-            print("Labels trong batch:", labels.unique().tolist())
+            print("Labels in batch:", labels.unique().tolist())
 
-            # ---- Tính mean vector cho các lớp mới ----
+            # ---- mean vector for new classes ----
             mu_list = []
             for class_idx in range(known_classes, total_classes):
                 cls_vecs = vecs[labels == class_idx]
-                if cls_vecs.numel() > 0:   # chỉ tính nếu có dữ liệu
+                if cls_vecs.numel() > 0:   # only calculate if have data
                     mean_vec = cls_vecs.mean(dim=0, keepdim=True)
                     mu_list.append(mean_vec)
 
             if len(mu_list) == 0:
-                print("WARNING: Không có class mới nào trong batch → skip update_stat")
+                print("WARNING: No new class in this batch → skip update_stat")
                 return
 
             mu = torch.cat(mu_list, dim=0)
 
-            # ---- Tính covariance ----
+            # ---- covariance ----
             center_list = []
             for j, i in enumerate(range(known_classes, total_classes)):
                 cls_vecs = vecs[labels == i]
@@ -146,19 +158,19 @@ class ClassIncrementalCLIP(nn.Module):
                     center_list.append(cls_vecs - mu[j])
 
             if len(center_list) == 0:
-                print("WARNING: center_vecs rỗng → skip update_stat")
+                print("WARNING: center_vecs is empty → skip update_stat")
                 return
 
             center_vecs = torch.cat(center_list, dim=0)
 
             cov = center_vecs.T @ center_vecs / (center_vecs.shape[0] - 1)
 
-            # regularization để ổn định nghịch đảo
+            # regularization for stable inverse
             dim = center_vecs.shape[1]
             reg = cov.trace() * torch.eye(dim, device=device)
             cov_inv = dim * torch.linalg.pinv((center_vecs.shape[0] - 1) * cov + reg)
 
-            # ---- Update hoặc khởi tạo ----
+            # ---- update/init ----
             if not hasattr(self, 'mu'):
                 self.mu = mu
                 self.cov_inv = cov_inv
@@ -176,10 +188,10 @@ class ClassIncrementalCLIP(nn.Module):
                 )
                 self.mu = torch.cat([self.mu, mu])
 
-            # prior đồng đều
+            # equal prior
             ps = torch.ones(self.mu.shape[0], device=device) / self.mu.shape[0]
 
-            # ✅ Cập nhật lại weight & bias
+            # update  weight & bias
             self.W = torch.einsum('nd,dc->cn', self.mu, self.cov_inv)   # [num_classes, dim]
             self.b = ps.log() - 0.5 * torch.einsum('nd,dc,nc->n', self.mu, self.cov_inv, self.mu)
 
@@ -196,18 +208,14 @@ class ClassIncrementalCLIP(nn.Module):
         return chain.from_iterable(params)
     
     def encode_text(self, text, prompt=False):
-        x = self.token_embedding(text).type(self.clip_type)
-        x = x + self.positional_embedding.type(self.clip_type)
-        x = x.permute(1, 0, 2)
-        x = self.transformer(x)
-        x = x.permute(1, 0, 2)
-        x = self.ln_final(x)
-        x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
-        return x
+        text = text.to(self.device)
+        text_features = self.model.encode_text(text)
+        return text_features.type(torch.float32)
 
     def encode_image(self, image):
-        image = image.to(self.clip_type)
-        return self.visual(image)
+        image = image.to(self.device, dtype=self.clip_type)
+        image_features = self.model.encode_image(image)
+        return image_features
 
     def freeze(self, module):
         for param in module.parameters():
@@ -239,6 +247,16 @@ class ClassIncrementalCLIP(nn.Module):
     @torch.no_grad()
     def get_class_name_features(self):
         class_name_features = self.encode_text(self.text_tokens)
+        templates_per_class = getattr(self, "templates_per_class", 1)
+        if templates_per_class > 1:
+            num_classes = len(self.total_class_names)
+            class_name_features = class_name_features.view(
+                num_classes, templates_per_class, -1
+            )
+            class_name_features = class_name_features / class_name_features.norm(
+                dim=-1, keepdim=True
+            )
+            class_name_features = class_name_features.mean(dim=1)
         return class_name_features.type(torch.float32)
 
     def adaptation(self, task_id, threshold=0):
@@ -246,9 +264,15 @@ class ClassIncrementalCLIP(nn.Module):
         self.known_classes = len(self.total_class_names)
         self.total_class_names += get_class_names(self.classes_names, self.class_ids_per_task[task_id])
         self.current_class_names = get_class_names(self.classes_names, self.class_ids_per_task[task_id])
-        self.text_tokens = self.tokenize(
-            [self.prompt_template.format(c) for c in self.total_class_names]
-        ).to(self.device)
+        if hasattr(self.cfg.engine, "templates") and self.cfg.engine.templates:
+            prompt_templates = self.cfg.engine.templates
+        else:
+            prompt_templates = [self.prompt_template]
+        self.templates_per_class = len(prompt_templates)
+        all_prompts = []
+        for cname in self.total_class_names:
+            all_prompts.extend([tmpl.format(cname) for tmpl in prompt_templates])
+        self.text_tokens = self.tokenize(all_prompts).to(self.device)
         self.text_end = self.text_tokens.max(dim=-1)[1]
         self.class_name_features = self.get_class_name_features()
         self.class_name_features = self.class_name_features / self.class_name_features.norm(dim=-1, p=2, keepdim=True)
@@ -311,8 +335,17 @@ class ClassIncrementalCLIP(nn.Module):
 
 
         #---------- text features ---------
-        with torch.no_grad():
-            text_features = self.encode_text(self.text_tokens)
+        if hasattr(self, "class_name_features") and self.class_name_features is not None:
+            text_features = self.class_name_features
+        else:
+            with torch.no_grad():
+                text_features = self.encode_text(self.text_tokens)
+            templates_per_class = getattr(self, "templates_per_class", 1)
+            if templates_per_class > 1:
+                num_classes = len(self.total_class_names)
+                text_features = text_features.view(num_classes, templates_per_class, -1)
+                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+                text_features = text_features.mean(dim=1)
 
         final_text_feas = self.apply_injections(self.text_injections, text_features)
         final_text_feas = final_text_feas / final_text_feas.norm(dim=-1, keepdim=True)
@@ -479,10 +512,20 @@ class ClassIncrementalCLIP(nn.Module):
 class DomainIncrementalCLIP(nn.Module):
     def __init__(self, cfg, device, jit=False) -> None:
         super().__init__()
-        self.model, self.transforms = clip.load(cfg.model_name, device=device, jit=jit)
+        model_name_cfg = getattr(cfg, "model_name", "ViT-B-16")
+        model_name = model_name_cfg.replace("/", "-")
+        pretrained = getattr(cfg, "openclip_pretrained", "laion2b_s34b_b88k")
+        self.model, preprocess_train, preprocess_val = open_clip.create_model_and_transforms(
+            model_name,
+            pretrained=pretrained,
+            device=device,
+            jit=jit,
+        )
+        self.transforms = preprocess_val
         self.text_tokens = None
         self.prompt_template = cfg.prompt_template
         self.device = device
+        self.tokenizer = open_clip.get_tokenizer(model_name)
 
     def forward(self, image):
         with torch.no_grad():
@@ -491,7 +534,7 @@ class DomainIncrementalCLIP(nn.Module):
         return probs
 
     def tokenize(self, class_names):
-        self.text_tokens = clip.tokenize(
+        self.text_tokens = self.tokenizer(
             [self.prompt_template.format(c) for c in class_names]
         ).to(self.device)
 
