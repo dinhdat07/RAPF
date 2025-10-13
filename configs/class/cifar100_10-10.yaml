@@ -12,7 +12,10 @@ class_order: ''
 dataset_root: ''
 workdir: ''
 log_path: metric.json
+
 model_name: ViT-B-16
+openclip_pretrained: laion2b_s34b_b88k
+
 prompt_template: a photo of a {}.
 batch_size: 64
 initial_increment: 10
@@ -40,7 +43,7 @@ engine:
   alpha: 0.7
   topk: 5
   descriptor_json: chat/cifar224_des.json
-  text_template: a photo of a {}, detailed
+  text_template: a photo of a {}
   num_prompts_cap: 8
   lambda_img: 0.5
   lambda_txt: 2
@@ -68,4 +71,4 @@ engine:
   - a good photo of the {}.
   - a photo of the small {}.
   - a photo of the big {}.
-openclip_pretrained: laion2b_s34b_b88k
+
