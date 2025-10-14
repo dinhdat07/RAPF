@@ -7,8 +7,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 from pyparsing import Any
 from omegaconf import DictConfig
-
-import open_clip
+import clip
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -56,23 +55,16 @@ class ClassIncrementalCLIP(nn.Module):
         self.device = device
         self.classes_names = None
 
-        model_name_cfg = getattr(cfg, "model_name", "ViT-B-16")
-        model_name = model_name_cfg.replace("/", "-")
-        pretrained = getattr(cfg, "openclip_pretrained", "laion400m_e32")
-        model, preprocess_train, preprocess_val = open_clip.create_model_and_transforms(
-            model_name,
-            pretrained=pretrained,
-            device=device,
-            jit=jit,
-        )
-        self.transforms = preprocess_train if preprocess_train is not None else preprocess_val
-        self.model = model
+        model, self.transforms = clip.load(cfg.model_name, device=device, jit=jit)
+        for param in model.parameters():
+            param.requires_grad = False
+            
         self.visual = model.visual
-        self.transformer = getattr(model, "transformer", None)
-        self.positional_embedding = getattr(model, "positional_embedding", None)
-        self.token_embedding = getattr(model, "token_embedding", None)
-        self.ln_final = getattr(model, "ln_final", None)
-        self.text_projection = getattr(model, "text_projection", None)
+        self.transformer = model.transformer
+        self.positional_embedding = model.positional_embedding
+        self.token_embedding = model.token_embedding
+        self.ln_final = model.ln_final
+        self.text_projection = model.text_projection
         self.logit_scale = model.logit_scale
 
         self.class_ids_per_task = list(get_class_ids_per_task(cfg))
@@ -81,10 +73,8 @@ class ClassIncrementalCLIP(nn.Module):
         self.known_classes = 0
         self.text_tokens = None
         self.dtype = torch.float16 if cfg.fp16 else torch.float32
-        self.adapter = nn.Linear(512, 512, bias=False, device=device)
-        self.clip_type = next(model.parameters()).dtype
-        self.tokenizer = open_clip.get_tokenizer(model_name)
-        self.tokenize = self.tokenizer
+        self.clip_type = model.dtype
+        self.tokenize = clip.tokenize
 
         # ENGINE
         self.engine_cfg = getattr(cfg, 'engine', None)
@@ -92,13 +82,14 @@ class ClassIncrementalCLIP(nn.Module):
         self.lambda_txt = float(getattr(self.engine_cfg, 'lambda_txt', 0.0)) if self.engine_cfg else 0.0
         self.replay_alpha = float(getattr(self.engine_cfg, 'replay_alpha', 0.0)) if self.engine_cfg else 0.0
         self.replay_sample_num = int(getattr(self.engine_cfg, 'sample_num', 0)) if self.engine_cfg else 0
-        self.image_injections = nn.ModuleList()
-        self.text_injections = nn.ModuleList()
+        
+        self.image_injection = MLP_Adapter(512, 512).to(self.device).to(dtype=self.dtype)
+        self.prev_image_injection = None
+        self.text_injection = MLP_Adapter(512, 512).to(self.device).to(dtype=self.dtype)
+        self.prev_text_injection = None
+        
         self.new_des_dict = {}
         self.prototype: List[torch.Tensor] = []
-
-        # old adapter
-        self.old_adapter = None
 
         # class stats
         self.class_mean_list = []
@@ -198,51 +189,47 @@ class ClassIncrementalCLIP(nn.Module):
     
 
     def get_trainable_parameters(self):
-        # params = [self.adapter.parameters()]
-
         params = []
-        if len(self.image_injections) > 0:
-            params.append(self.image_injections[-1].parameters())
-        if len(self.text_injections) > 0:
-            params.append(self.text_injections[-1].parameters())
+        if self.image_injection is not None:
+            params.append(self.image_injection.parameters())
+        if self.text_injection is not None:
+            params.append(self.text_injection.parameters())
         return chain.from_iterable(params)
     
     def encode_text(self, text, prompt=False):
-        text = text.to(self.device)
-        text_features = self.model.encode_text(text)
-        return text_features.type(torch.float32)
+        x = self.token_embedding(text).type(self.clip_type)
+        x = x + self.positional_embedding.type(self.clip_type)
+        x = x.permute(1, 0, 2)
+        x = self.transformer(x)
+        x = x.permute(1, 0, 2)
+        x = self.ln_final(x)
+        x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
+        return x
 
     def encode_image(self, image):
-        image = image.to(self.device, dtype=self.clip_type)
-        image_features = self.model.encode_image(image)
-        return image_features
+        image = image.to(self.clip_type)
+        return self.visual(image)
 
     def freeze(self, module):
         for param in module.parameters():
             param.requires_grad = False
 
     def update_injection_units(self):   
-        if len(self.image_injections)>0:
-            self.freeze(self.image_injections[-1])
-            self.freeze(self.text_injections[-1])
-        self.image_injections.append(MLP_Adapter(512, 512).to(self.device))
-        self.text_injections.append(MLP_Adapter(512, 512).to(self.device))
-    
-    def apply_injections(self, modules: nn.ModuleList, features: torch.Tensor) -> torch.Tensor:
-        res = []
-        for i in range(len(modules)):
-            res.append(modules[i](features))
-        res = torch.sum(torch.stack(res), dim=0)
-        return res
-    
-    def apply_injections(self, modules: nn.ModuleList, features: torch.Tensor) -> torch.Tensor:
-        if len(modules) == 0:
-            return torch.zeros_like(features)
-        res = 0
+        if self.image_injection is not None:
+            self.prev_image_injection = copy.deepcopy(self.image_injection)
+            self.prev_text_injection = copy.deepcopy(self.text_injection)
+            self.freeze(self.prev_image_injection)
+            self.freeze(self.prev_text_injection)
+
+    def apply_image_injection(self, features: torch.Tensor, is_old=False) -> torch.Tensor:
         features = features.float()  
-        for m in modules:
-            res = res + m(features)
-        return res
+        if is_old and self.prev_image_injection is not None:
+            return self.prev_image_injection(features)
+        return self.image_injection(features)
+
+    def apply_text_injection(self, features: torch.Tensor) -> torch.Tensor:
+        features = features.float()  
+        return self.text_injection(features)
     
     @torch.no_grad()
     def get_class_name_features(self):
@@ -260,7 +247,6 @@ class ClassIncrementalCLIP(nn.Module):
         return class_name_features.type(torch.float32)
 
     def adaptation(self, task_id, threshold=0):
-        self.update_injection_units()
         self.known_classes = len(self.total_class_names)
         self.total_class_names += get_class_names(self.classes_names, self.class_ids_per_task[task_id])
         self.current_class_names = get_class_names(self.classes_names, self.class_ids_per_task[task_id])
@@ -279,7 +265,7 @@ class ClassIncrementalCLIP(nn.Module):
         self.queue_empty = True
         self.hard_pairs = None
         if task_id>0:
-            self.old_adapter = copy.deepcopy(self.adapter)
+            self.update_injection_units()
             dist_list = []
             for _, class_name_feature in enumerate(self.class_name_features[:-len(self.class_ids_per_task[task_id])]):
                 diff = torch.cdist(self.class_name_features[-len(self.class_ids_per_task[task_id]):].type(torch.float32), class_name_feature.unsqueeze(0).type(torch.float32)).squeeze()
@@ -303,36 +289,31 @@ class ClassIncrementalCLIP(nn.Module):
         image_features = clip_features
 
         # concat memory data and apply injection 
-        image_features = self.apply_injections(self.image_injections, image_features)
+        image_features = self.apply_image_injection(image_features)
         image_features = image_features/image_features.norm(dim=-1, keepdim=True)        
         if memory_data is not None:
             memory_data = memory_data.type(self.dtype)
-            sg_image_features = self.apply_injections(self.image_injections, memory_data)
+            sg_image_features = self.apply_image_injection(memory_data)
             sg_image_features = sg_image_features / sg_image_features.norm(dim=-1, keepdim=True)
             img_feas = torch.cat([image_features, sg_image_features], dim=0)
         else:
             img_feas = image_features
 
-        # not apply injection for edge samples
-        pre_adapter = img_feas
         edge_num = 0
 
         if edge_sample is not None:
             edge_sample = edge_sample.type(self.dtype)
             edge_num = edge_sample.shape[0]
-            pre_adapter = torch.cat([pre_adapter, edge_sample], dim=0)
+            edge_sample = self.apply_image_injection(edge_sample)
+            edge_sample = edge_sample / edge_sample.norm(dim=-1, keepdim=True)
+            img_feas = torch.cat([img_feas, edge_sample], dim=0)
 
-        # RAPF: apply adapter
-        # final_image_feas = self.adapter(pre_adapter.type(self.dtype).detach()).type(self.clip_type)
-
-        final_image_feas = pre_adapter
-        final_image_feas = final_image_feas / final_image_feas.norm(dim=1, keepdim=True)
+        final_image_feas = img_feas
 
         edge_sample_features = None
         if edge_sample is not None:
             edge_sample_features = final_image_feas[-edge_num:]
             final_image_feas = final_image_feas[:-edge_num]
-
 
         #---------- text features ---------
         if hasattr(self, "class_name_features") and self.class_name_features is not None:
@@ -347,7 +328,7 @@ class ClassIncrementalCLIP(nn.Module):
                 text_features = text_features / text_features.norm(dim=-1, keepdim=True)
                 text_features = text_features.mean(dim=1)
 
-        final_text_feas = self.apply_injections(self.text_injections, text_features)
+        final_text_feas = self.apply_text_injection(text_features)
         final_text_feas = final_text_feas / final_text_feas.norm(dim=-1, keepdim=True)
 
         #---------- logits ---------
@@ -357,7 +338,7 @@ class ClassIncrementalCLIP(nn.Module):
 
         if not_ini:
             with torch.no_grad():
-                old_memory_feature = self.old_adapter(memory_data)
+                old_memory_feature = self.apply_image_injection(memory_data, is_old=True)
                 old_memory_feature = old_memory_feature / old_memory_feature.norm(dim=1, keepdim=True)
             if edge_sample is not None:
                 return probs, final_image_feas, old_memory_feature, edge_sample_features, img_feas, raw_image_features
@@ -389,19 +370,24 @@ class ClassIncrementalCLIP(nn.Module):
             self.class_mean_list.append(mean)
             self.class_cov_list.append(cov)
 
+    def _mix_linear(self, new_layer, old_layer):
+        weight_new = new_layer.weight.data
+        weight_old = old_layer.weight.data
+        U_old, S_old, V_old = torch.linalg.svd(weight_old, full_matrices=False)
+        P_new = U_old.T @ weight_new
+        dist = (P_new - torch.diag(S_old) @ V_old).abs()
+        mask = dist / dist.max()
+        mask += self.mix_b
+        mask = torch.clamp(mask, max=1)
+        right = P_new * mask + torch.diag(S_old) @ V_old * (1 - mask)
+        weight = U_old @ right
+        new_layer.weight.data = weight
+
     def mix_matrix(self):
-        if self.old_adapter is not None:
-            weight_new = self.adapter.weight.data
-            weight_old = self.old_adapter.weight.data
-            U_old, S_old, V_old = torch.linalg.svd(weight_old)
-            P_new = U_old.T @ weight_new
-            dist = (P_new - torch.diag(S_old) @ V_old).abs()
-            mask = dist / dist.max()
-            mask += self.mix_b
-            mask = torch.clamp(mask, max=1)
-            right = P_new * mask + torch.diag(S_old) @ V_old * (1 - mask)
-            weight = U_old @ right
-            self.adapter.weight.data = weight
+        if self.prev_image_injection is not None and self.image_injection is not None:
+            self._mix_linear(self.image_injection.fc[0], self.prev_image_injection.fc[0])
+        if self.prev_text_injection is not None and self.text_injection is not None:
+            self._mix_linear(self.text_injection.fc[0], self.prev_text_injection.fc[0])
 
     def _flatten_values(value: Any) -> List[str]:
         out: List[str] = []
@@ -512,29 +498,19 @@ class ClassIncrementalCLIP(nn.Module):
 class DomainIncrementalCLIP(nn.Module):
     def __init__(self, cfg, device, jit=False) -> None:
         super().__init__()
-        model_name_cfg = getattr(cfg, "model_name", "ViT-B-16")
-        model_name = model_name_cfg.replace("/", "-")
-        pretrained = getattr(cfg, "openclip_pretrained", "laion2b_s34b_b88k")
-        self.model, preprocess_train, preprocess_val = open_clip.create_model_and_transforms(
-            model_name,
-            pretrained=pretrained,
-            device=device,
-            jit=jit,
-        )
-        self.transforms = preprocess_val
+        self.model, self.transforms = clip.load(cfg.model_name, device=device, jit=jit)
         self.text_tokens = None
         self.prompt_template = cfg.prompt_template
         self.device = device
-        self.tokenizer = open_clip.get_tokenizer(model_name)
 
     def forward(self, image):
         with torch.no_grad():
             logits_per_image, _ = self.model(image, self.text_tokens)
             probs = logits_per_image.softmax(dim=-1).cpu().numpy()
         return probs
-
+    
     def tokenize(self, class_names):
-        self.text_tokens = self.tokenizer(
+        self.text_tokens = clip.tokenize(
             [self.prompt_template.format(c) for c in class_names]
         ).to(self.device)
 
@@ -566,4 +542,3 @@ def load_model(cfg: DictConfig, device: torch.device) -> nn.Module:
             `{cfg.scenarios}` is not a valid scenario, 
             Please choose from ['class', "domain', 'task-agnostic']
         """)
-    

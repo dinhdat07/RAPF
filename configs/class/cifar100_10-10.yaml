@@ -1,4 +1,4 @@
-hydra:
+﻿hydra:
   run:
     dir: ./experiments/${scenario}/${dataset}_${initial_increment}-${increment}_without_exp
   job:
@@ -12,10 +12,7 @@ class_order: ''
 dataset_root: ''
 workdir: ''
 log_path: metric.json
-
 model_name: ViT-B-16
-openclip_pretrained: laion2b_s34b_b88k
-
 prompt_template: a photo of a {}.
 batch_size: 64
 initial_increment: 10
@@ -33,7 +30,7 @@ milestones:
 - 10
 beta: 2
 mix_bias: 0.6
-threshold: 0.55
+threshold: 0.3
 shrinkage: false
 engine:
   enable_otf: true
@@ -71,4 +68,3 @@ engine:
   - a good photo of the {}.
   - a photo of the small {}.
   - a photo of the big {}.
-
