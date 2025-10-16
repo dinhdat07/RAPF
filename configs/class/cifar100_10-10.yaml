@@ -1,4 +1,4 @@
-﻿hydra:
+﻿﻿hydra:
   run:
     dir: ./experiments/${scenario}/${dataset}_${initial_increment}-${increment}_without_exp
   job:
@@ -21,16 +21,16 @@ scenario: class
 dataset: cifar100
 num_workers: 8
 train_batch_size: 64
-epochs: 10
-lr: 0.001
+epochs: 15
+lr: 0.03
 fp16: false
 seed: 1993
 milestones:
 - 4
 - 10
-beta: 2
-mix_bias: 0.6
-threshold: 0.3
+beta: 2.5
+mix_bias: 1
+threshold: 0.5
 shrinkage: false
 engine:
   enable_otf: true
@@ -42,13 +42,13 @@ engine:
   descriptor_json: chat/cifar224_des.json
   text_template: a photo of a {}
   num_prompts_cap: 8
-  lambda_img: 0.5
+  lambda_img: 1
   lambda_txt: 2
-  replay_alpha: 0.25
-  sample_num: 0
+  replay_alpha: 0.7
+  sample_num: 200
   rerank: 0.5
-  stat: 0.8
-  sample_noise: 0.25
+  stat: 0.5
+  sample_noise: 0.2
   templates:
   - a photo of a {}.
   - a blurry photo of a {}.

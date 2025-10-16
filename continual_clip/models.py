@@ -83,9 +83,9 @@ class ClassIncrementalCLIP(nn.Module):
         self.replay_alpha = float(getattr(self.engine_cfg, 'replay_alpha', 0.0)) if self.engine_cfg else 0.0
         self.replay_sample_num = int(getattr(self.engine_cfg, 'sample_num', 0)) if self.engine_cfg else 0
         
-        self.image_injection = MLP_Adapter(512, 512).to(self.device).to(dtype=self.dtype)
+        self.image_injection = nn.ModuleList()
         self.prev_image_injection = None
-        self.text_injection = MLP_Adapter(512, 512).to(self.device).to(dtype=self.dtype)
+        self.text_injection = nn.ModuleList()
         self.prev_text_injection = None
         
         self.new_des_dict = {}
@@ -190,10 +190,12 @@ class ClassIncrementalCLIP(nn.Module):
 
     def get_trainable_parameters(self):
         params = []
-        if self.image_injection is not None:
-            params.append(self.image_injection.parameters())
-        if self.text_injection is not None:
-            params.append(self.text_injection.parameters())
+        # Lấy parameters adapter cuối cùng (task mới)
+        if self.image_injection and len(self.image_injection) > 0:
+            params.append(self.image_injection[-1].parameters())
+        if self.text_injection and len(self.text_injection) > 0:
+            params.append(self.text_injection[-1].parameters())
+        
         return chain.from_iterable(params)
     
     def encode_text(self, text, prompt=False):
@@ -214,22 +216,50 @@ class ClassIncrementalCLIP(nn.Module):
         for param in module.parameters():
             param.requires_grad = False
 
-    def update_injection_units(self):   
-        if self.image_injection is not None:
-            self.prev_image_injection = copy.deepcopy(self.image_injection)
-            self.prev_text_injection = copy.deepcopy(self.text_injection)
-            self.freeze(self.prev_image_injection)
-            self.freeze(self.prev_text_injection)
+
+    def update_injection_units(self):
+
+        # Freeze adapter cũ, không freeze adapter mới
+        # if self.image_injection:
+        #         self.freeze(self.image_injection[-1])
+        # if self.text_injection:
+        #         self.freeze(self.text_injection[-1])
+        # Thêm adapter mới vào list
+        if self.image_injection:
+            self.image_injection.append(self.image_injection[-1])
+        else:
+            self.image_injection.append(MLP_Adapter(512, 512).to(self.device).to(dtype=self.dtype))
+        if self.text_injection:
+            self.text_injection.append(self.text_injection[-1])
+        else:
+            self.text_injection.append(MLP_Adapter(512, 512).to(self.device).to(dtype=self.dtype))
+            
 
     def apply_image_injection(self, features: torch.Tensor, is_old=False) -> torch.Tensor:
-        features = features.float()  
-        if is_old and self.prev_image_injection is not None:
-            return self.prev_image_injection(features)
-        return self.image_injection(features)
+        features = features.float()
+        image_res = []
+
+        if len(self.image_injection) > 0:
+            for inj in self.image_injection:
+                image_res.append(inj(features))
+
+            return torch.sum(torch.stack(image_res), dim=0)
+        
+        return features
 
     def apply_text_injection(self, features: torch.Tensor) -> torch.Tensor:
-        features = features.float()  
-        return self.text_injection(features)
+        # Lấy dtype của module đầu tiên trong text_injection
+        target_dtype = next(self.text_injection[0].parameters()).dtype
+
+        # Ép feature về cùng dtype
+        features = features.to(dtype=target_dtype)
+
+        text_res = []
+        for i in range(len(self.text_injection)):
+            text_res.append(self.text_injection[i](features))
+        
+        text_res = torch.sum(torch.stack(text_res), dim=0)
+        return text_res
     
     @torch.no_grad()
     def get_class_name_features(self):
@@ -282,6 +312,7 @@ class ClassIncrementalCLIP(nn.Module):
         
         # --------- image features ---------
         image = image.type(self.dtype)
+
         with torch.no_grad():
             clip_features = self.encode_image(image).float()
         raw_image_features = clip_features / clip_features.norm(dim=-1, keepdim=True)
@@ -370,7 +401,7 @@ class ClassIncrementalCLIP(nn.Module):
             self.class_mean_list.append(mean)
             self.class_cov_list.append(cov)
 
-    def _mix_linear(self, new_layer, old_layer):
+    def _mix_linear(self, new_layer, old_layer,mask_scale=1.0):
         weight_new = new_layer.weight.data
         weight_old = old_layer.weight.data
         U_old, S_old, V_old = torch.linalg.svd(weight_old, full_matrices=False)
@@ -378,16 +409,37 @@ class ClassIncrementalCLIP(nn.Module):
         dist = (P_new - torch.diag(S_old) @ V_old).abs()
         mask = dist / dist.max()
         mask += self.mix_b
+        mask = mask * mask_scale
         mask = torch.clamp(mask, max=1)
         right = P_new * mask + torch.diag(S_old) @ V_old * (1 - mask)
         weight = U_old @ right
         new_layer.weight.data = weight
 
+    
+
+
     def mix_matrix(self):
-        if self.prev_image_injection is not None and self.image_injection is not None:
-            self._mix_linear(self.image_injection.fc[0], self.prev_image_injection.fc[0])
-        if self.prev_text_injection is not None and self.text_injection is not None:
-            self._mix_linear(self.text_injection.fc[0], self.prev_text_injection.fc[0])
+        # Cần ít nhất 2 adapter để mix
+        if len(self.image_injection) < 2:
+            return
+
+        curr_adapter_img = self.image_injection[-1]
+        prev_adapters_img = self.image_injection[:-1]  # tất cả adapter cũ
+
+        # Mix tất cả adapter cũ (nếu muốn học từ nhiều task cũ)
+        for i, prev_adapter in enumerate(prev_adapters_img):
+            # Giảm dần ảnh hưởng của adapter cũ theo khoảng cách thời gian
+            mask_scale = 1.0 / (i + 1)
+            self._mix_linear(curr_adapter_img.fc[0], prev_adapter.fc[0], mask_scale)
+    
+    # def mix_matrix(self):
+    #     if len(self.image_injection) < 2:
+    #         return
+    #     curr_adapter_img = self.image_injection[-1]
+    #     prev_adapter_img = self.image_injection[-2]
+    #     self._mix_linear(curr_adapter_img.fc[0], prev_adapter_img.fc[0])
+
+
 
     def _flatten_values(value: Any) -> List[str]:
         out: List[str] = []

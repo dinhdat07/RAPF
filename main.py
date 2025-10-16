@@ -47,6 +47,7 @@ def run_class_incremental(cfg, device):
     
     # model = load_model(cfg, device)
     model = ClassIncrementalCLIP(cfg, device)
+    model.update_injection_units()
 
     eval_dataset, classes_names = build_cl_scenarios(cfg, is_train=False, base_transforms=model.transforms)
     train_dataset, _ = build_cl_scenarios(cfg, is_train=True, base_transforms=model.transforms)
@@ -110,6 +111,8 @@ def run_class_incremental(cfg, device):
                         proto = model.prototype[i].to(device).clone()
                         if model.sample_noise > 0:
                             proto = proto + torch.randn_like(proto) * model.sample_noise
+                        sg_inputs.append(sample(model.class_mean_list[i], model.class_cov_list[i],int(10*cfg.beta), shrink=cfg.shrinkage))
+                        sg_targets.append(torch.ones(int(10*cfg.beta), dtype=torch.long, device=device)*i)
                         sg_inputs.append(proto.unsqueeze(0))
                         sg_targets.append(torch.ones(1, dtype=torch.long, device=device) * i)
                     if sg_inputs:
@@ -139,7 +142,7 @@ def run_class_incremental(cfg, device):
                 outputs, final_image_feas, __, edge_sample_features, pre_image_feas, _raw_image_feas = model(inputs, memory_data=sg_inputs, not_ini=not_ini, edge_sample=edge_sample)
                 
                 # RAPF: calculate loss hinge
-                if edge_sample is not None and edge_sample_features is not None:
+                if task_id>0 and edge_sample is not None and edge_sample_features is not None:
                     edge_sample_features = edge_sample_features / edge_sample_features.norm(dim=-1, keepdim=True)
                     edge_target_features = model.class_name_features[edge_p_target].type(edge_sample_features.dtype)
                     edge_target_features = edge_target_features / edge_target_features.norm(dim=-1, keepdim=True)
@@ -185,7 +188,7 @@ def run_class_incremental(cfg, device):
                     ref_text_loss = sum(ref_text_loss_list) / len(ref_text_loss_list)
                 else:
                     ref_text_loss = 0
-
+                
                 clip_loss=cliploss(final_image_feas, clip_text_feas, model.logit_scale)
 
                 # RAPF: calculate contrastive loss
