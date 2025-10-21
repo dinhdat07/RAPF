@@ -29,8 +29,8 @@ milestones:
 - 4
 - 10
 beta: 2
-mix_bias: 0.6
-threshold: 0.3
+mix_bias: 0.3
+threshold: 0.55
 shrinkage: false
 engine:
   enable_otf: true

@@ -1,6 +1,6 @@
 ﻿import os
 
-from continual_clip.utils import engine_rerank
+from continual_clip.utils import engine_rerank, tensor2numpy
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import json
 import pdb
@@ -51,7 +51,8 @@ def run_class_incremental(cfg, device):
     eval_dataset, classes_names = build_cl_scenarios(cfg, is_train=False, base_transforms=model.transforms)
     train_dataset, _ = build_cl_scenarios(cfg, is_train=True, base_transforms=model.transforms)
     model.classes_names = classes_names
-    des_dict =  model._get_text_des(dataname='cifar224') 
+    print(model.classes_names)
+    model.get_text_des(dataname='cifar224') 
     acc_list = []
     metric_logger = Logger(list_subsets=["train", "test"])
 
@@ -71,6 +72,7 @@ def run_class_incremental(cfg, device):
 
         from continual_clip.losses import ClipLoss
         cliploss=ClipLoss()
+
         for i_epoch in range(epochs):
             loss = torch.tensor(0.0).to(device)
             loss_hinge = torch.tensor(0.0, device=device)
@@ -175,7 +177,7 @@ def run_class_incremental(cfg, device):
                     repeat_ = 1 
                     ref_text_loss_list = []
                     for _ in range(repeat_):
-                        ref_texts = model._get_batch_des(model.new_des_dict, labels)
+                        ref_texts = model.get_batch_des(model.new_des_dict, labels)
                         ref_emb = model.tokenize(ref_texts).to(model.device)
                         with torch.no_grad():
                             ref_text_features = model.encode_text(ref_emb)
@@ -198,7 +200,7 @@ def run_class_incremental(cfg, device):
                 optimizer.step()
                 optimizer.zero_grad()
                 tqdm_loader.set_description(
-                    f"Ep {i_epoch + 1}/{cfg.epochs} | L: {loss.item():.4f} | Clip_loss: {clip_loss.item():.4f} | "
+                    f"Ep {i_epoch + 1}/{cfg.epochs} | clip_loss: {clip_loss.item():.4f} | "
                     f"Li: {image_aug_loss.item():.4f} | Lt: {ref_text_loss.item():.4f} | Lh: {loss_hinge.item():.4f} | lr: {scheduler.get_last_lr()[0]:.4f}"
                 )
             
@@ -211,7 +213,7 @@ def run_class_incremental(cfg, device):
                     metric_logger.add([outputs.cpu().argmax(dim=1), targets.cpu(), task_ids], subset="train")
         
         
-        sample_loader = DataLoader(train_dataset[task_id], batch_size=128, shuffle=False, num_workers=cfg.num_workers)
+        sample_loader = DataLoader(train_dataset[task_id], batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers)
         sample_data = []
         sample_target = []
         sample_after_adapt_feature = []
@@ -230,25 +232,71 @@ def run_class_incremental(cfg, device):
         model.mix_matrix()
         model.eval()
 
+
         eval_loader = DataLoader(eval_dataset[:task_id + 1], batch_size=cfg.batch_size, num_workers=cfg.num_workers)
-        for inputs, targets, task_ids in eval_loader:
+
+        total_labels = model.total_class_names
+        print('total labels:', total_labels)
+        templates = cfg.engine.templates
+        print('templates used:', templates)
+        text_features = []
+        with torch.no_grad():
+            for l in total_labels:
+                texts = [t.format(l) for t in templates]
+                texts = model.tokenize(texts).to(device)
+                class_embeddings = model.encode_text(texts)
+                class_embeddings = model.apply_text_injection(class_embeddings)
+                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
+                class_embeddings = class_embeddings.mean(dim=0)
+                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
+                text_features.append(class_embeddings)
+            text_features = torch.stack(text_features, dim=0)
+            
+        correct, total = 0, 0
+        for i, (inputs, targets, task_ids) in enumerate(eval_loader):
             inputs, targets = inputs.to(device), targets.to(device)
             with torch.no_grad():
-                outputs, _, __, ___, _pre_image_feas, raw_image_feas = model(inputs)
-                outputs = engine_rerank(
-                    model=model,
-                    device=device,
-                    epoch=epochs - 1,
-                    cfg=cfg,
-                    outputs=outputs,
-                    raw_image_feas=raw_image_feas,
+                transf_image_features = model.encode_image(inputs)
+                transf_image_features = model.apply_image_injection(transf_image_features)
+                transf_image_features = transf_image_features / transf_image_features.norm(dim=-1, keepdim=True)
+
+                transf_text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+                transf_image_features_raw_ = model.visual_forward_(inputs)
+                transf_image_features_raw = transf_image_features_raw_ @ model.visual.proj
+                transf_image_features_raw_ = transf_image_features_raw_ / transf_image_features_raw_.norm(dim=-1, keepdim=True)
+                transf_image_features_raw = transf_image_features_raw / transf_image_features_raw.norm(dim=-1, keepdim=True)
+                
+                outputs = (transf_image_features @ transf_text_features.T)
+
+                dtype_W = model.W.dtype
+                outputs_gda = (transf_image_features_raw_.to(dtype_W) @ model.W) + model.b.to(dtype_W)
+                outputs_gda = outputs_gda / outputs_gda.norm(dim=-1, keepdim=True)
+                
+                outputs_rerank = model.rerank(outputs, transf_image_features_raw, device)
+            
+                outputs = (
+                    outputs_gda * cfg.engine.stat
+                    + (cfg.engine.rerank * outputs_rerank
+                        + (1 - cfg.engine.rerank) * outputs) * (1 - cfg.engine.stat)
                 )
-                torch.nn.functional.softmax(outputs, dim=-1)
-            metric_logger.add([outputs.cpu().argmax(dim=1), targets.cpu(), task_ids], subset="test")
+                    
+            predicts = torch.max(outputs, dim=1)[1]
+            correct += (predicts == targets).sum()
+            total   += targets.size(0)
+
+            # ensure cpu for logger
+            if torch.is_tensor(task_ids):
+                task_ids_cpu = task_ids.cpu()
+            else:
+                task_ids_cpu = torch.full((targets.size(0),), int(task_ids), dtype=torch.long)
+                
+            metric_logger.add([outputs.cpu().argmax(dim=1), targets.cpu(), task_ids_cpu], subset="test")
+        
+        test_acc = round((correct * 100.0) / total, 2) if total > 0 else 0.0
 
 
         # ----- Test logging -----
-        test_acc = 100 * metric_logger.accuracy  # accuracy trên test set
         avg_acc = 100 * metric_logger.average_incremental_accuracy
         forgetting_val = 100 * metric_logger.forgetting
         acc_per_task = [round(100 * acc_t, 2) for acc_t in metric_logger.accuracy_per_task]
@@ -257,7 +305,7 @@ def run_class_incremental(cfg, device):
 
         # ----- Train logging -----
         train_acc = 100 * metric_logger.online_accuracy if hasattr(metric_logger, "online_accuracy") else None
-
+        
         # ----- Append vào danh sách để vẽ acc curve -----
         acc_list.append(test_acc)
 
