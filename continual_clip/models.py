@@ -1,5 +1,6 @@
 import copy
 import json
+import math
 import pdb
 from itertools import chain
 import random
@@ -24,6 +25,54 @@ class MLP_Adapter(nn.Module):
     def forward(self, x):
         x_ = self.fc(x)
         return x_
+    
+
+class ENGINE_Adapter(nn.Module):
+    def __init__(self, c_in, hidden, dropout=0.1, use_layernorm=True, learnable_scale=True):
+        super(ENGINE_Adapter, self).__init__()
+
+        # Down và up giống TUNA, nhưng đơn giản hơn
+        self.down_proj = nn.Linear(c_in, hidden)
+        self.non_linear = nn.ReLU()
+        self.up_proj = nn.Linear(hidden, c_in)
+        self.dropout = nn.Dropout(dropout)
+
+        # LayerNorm giúp ổn định phân phối giữa các task
+        self.use_layernorm = use_layernorm
+        if use_layernorm:
+            self.layernorm = nn.LayerNorm(c_in)
+
+        # Thang đo học được giúp adapter điều chỉnh mức ảnh hưởng
+        if learnable_scale:
+            self.scale = nn.Parameter(torch.ones(1))
+        else:
+            self.register_buffer("scale", torch.tensor(1.0))
+        # Khởi tạo nhẹ (tương tự init_option="lora" của TUNA)
+        nn.init.kaiming_uniform_(self.down_proj.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.up_proj.weight)
+        nn.init.zeros_(self.down_proj.bias)
+        nn.init.zeros_(self.up_proj.bias)
+
+    def forward(self, x):
+        residual = x
+
+        if self.use_layernorm:
+            x = self.layernorm(x)
+
+        # forward adapter
+        x = self.down_proj(x)
+        x = self.non_linear(x)
+        x = self.dropout(x)
+        x = self.up_proj(x)
+
+        # điều chỉnh mức ảnh hưởng
+        x = x * self.scale
+
+        # thêm residual để giữ thông tin gốc
+        return residual + x
+
+
+
     
 def shrink_cov(cov):
     diag_mean = torch.mean(torch.diagonal(cov))
@@ -56,6 +105,8 @@ class ClassIncrementalCLIP(nn.Module):
         self.classes_names = None
 
         model, self.transforms = clip.load(cfg.model_name, device=device, jit=jit)
+
+
         for param in model.parameters():
             param.requires_grad = False
             
@@ -219,20 +270,14 @@ class ClassIncrementalCLIP(nn.Module):
 
     def update_injection_units(self):
 
-        # Freeze adapter cũ, không freeze adapter mới
-        # if self.image_injection:
-        #         self.freeze(self.image_injection[-1])
-        # if self.text_injection:
-        #         self.freeze(self.text_injection[-1])
-        # Thêm adapter mới vào list
         if self.image_injection:
             self.image_injection.append(self.image_injection[-1])
         else:
-            self.image_injection.append(MLP_Adapter(512, 512).to(self.device).to(dtype=self.dtype))
+            self.image_injection.append(ENGINE_Adapter(512, 256, dropout=0.1).to(self.device).to(dtype=self.dtype))
         if self.text_injection:
             self.text_injection.append(self.text_injection[-1])
         else:
-            self.text_injection.append(MLP_Adapter(512, 512).to(self.device).to(dtype=self.dtype))
+            self.text_injection.append(ENGINE_Adapter(512, 256, dropout=0.1).to(self.device).to(dtype=self.dtype))
             
 
     def apply_image_injection(self, features: torch.Tensor, is_old=False) -> torch.Tensor:
@@ -401,43 +446,64 @@ class ClassIncrementalCLIP(nn.Module):
             self.class_mean_list.append(mean)
             self.class_cov_list.append(cov)
 
-    def _mix_linear(self, new_layer, old_layer,mask_scale=1.0):
+    def _mix_linear(self, new_layer, old_layer, mask_scale=1.0):
+        """
+        Mix trọng số của 2 tầng Linear (new_layer và old_layer) bằng SVD-based alignment.
+        new_layer: nn.Linear (trong adapter mới)
+        old_layer: nn.Linear (trong adapter cũ)
+        mask_scale: độ ảnh hưởng của old adapter (0–1)
+        """
         weight_new = new_layer.weight.data
         weight_old = old_layer.weight.data
+
+        # Phân tích SVD trọng số của old adapter
         U_old, S_old, V_old = torch.linalg.svd(weight_old, full_matrices=False)
+
+        # Chiếu trọng số mới vào không gian của old adapter
         P_new = U_old.T @ weight_new
+
+        # Tạo mask dựa trên độ khác biệt
         dist = (P_new - torch.diag(S_old) @ V_old).abs()
-        mask = dist / dist.max()
-        mask += self.mix_b
-        mask = mask * mask_scale
-        mask = torch.clamp(mask, max=1)
-        right = P_new * mask + torch.diag(S_old) @ V_old * (1 - mask)
-        weight = U_old @ right
-        new_layer.weight.data = weight
+        mask = dist / (dist.max() + 1e-6)  # tránh chia 0
+        mask = torch.clamp(mask * mask_scale, 0, 1)
+
+        # Kết hợp hai ma trận
+        right = P_new * mask + (torch.diag(S_old) @ V_old) * (1 - mask)
+        weight_mixed = U_old @ right
+
+        new_layer.weight.data.copy_(weight_mixed)
+
+        # Cập nhật bias nếu có
+        if new_layer.bias is not None and old_layer.bias is not None:
+            new_layer.bias.data.copy_(
+                new_layer.bias.data * (1 - mask_scale) + old_layer.bias.data * mask_scale
+            )
 
     
-
-
     def mix_matrix(self):
-        # Cần ít nhất 2 adapter để mix
         if len(self.image_injection) < 2:
-            return
+            return  # Cần ít nhất 2 adapter mới mix được
 
-        curr_adapter_img = self.image_injection[-1]
-        prev_adapters_img = self.image_injection[:-1]  # tất cả adapter cũ
+        curr_adapter_img = self.image_injection[-1]     # Adapter hiện tại (task mới)
+        prev_adapters_img = self.image_injection[:-1]   # Các adapter cũ
 
-        # Mix tất cả adapter cũ (nếu muốn học từ nhiều task cũ)
+        # Lặp qua từng adapter cũ để mix dần
         for i, prev_adapter in enumerate(prev_adapters_img):
-            # Giảm dần ảnh hưởng của adapter cũ theo khoảng cách thời gian
-            mask_scale = 1.0 / (i + 1)
-            self._mix_linear(curr_adapter_img.fc[0], prev_adapter.fc[0], mask_scale)
-    
-    # def mix_matrix(self):
-    #     if len(self.image_injection) < 2:
-    #         return
-    #     curr_adapter_img = self.image_injection[-1]
-    #     prev_adapter_img = self.image_injection[-2]
-    #     self._mix_linear(curr_adapter_img.fc[0], prev_adapter_img.fc[0])
+            mask_scale = 1.0 / (i + 1)  # Càng xa thì ảnh hưởng càng nhỏ
+
+            # Mix tầng down_proj
+            self._mix_linear(curr_adapter_img.down_proj, prev_adapter.down_proj, mask_scale)
+
+            # Mix tầng up_proj
+            self._mix_linear(curr_adapter_img.up_proj, prev_adapter.up_proj, mask_scale)
+
+            # Optional: mix cả layernorm nếu bạn có
+            if hasattr(curr_adapter_img, "layernorm") and hasattr(prev_adapter, "layernorm"):
+                curr_ln_weight = curr_adapter_img.layernorm.weight.data
+                prev_ln_weight = prev_adapter.layernorm.weight.data
+                curr_adapter_img.layernorm.weight.data.copy_(
+                    curr_ln_weight * (1 - mask_scale) + prev_ln_weight * mask_scale
+                )
 
 
 

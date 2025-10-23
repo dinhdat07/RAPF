@@ -65,7 +65,7 @@ def run_class_incremental(cfg, device):
         model.train()
 
         trainable_params = list(model.get_trainable_parameters())
-        optimizer = torch.optim.AdamW(trainable_params, lr=0.05, weight_decay=0.05)
+        optimizer = torch.optim.AdamW(trainable_params, lr=cfg.lr, weight_decay=0.05)
         milestones = cfg.milestones
         epochs = cfg.epochs
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=0)
@@ -196,7 +196,7 @@ def run_class_incremental(cfg, device):
                 
                 # loss =  loss_ce + loss_hinge  + clip_loss + model.lambda_img * image_aug_loss + model.lambda_txt * ref_text_loss
 
-                loss = clip_loss + model.lambda_img * image_aug_loss + model.lambda_txt * ref_text_loss + loss_hinge
+                loss =  clip_loss +  model.lambda_img * image_aug_loss + model.lambda_txt * ref_text_loss + loss_hinge
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
