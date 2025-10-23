@@ -1,6 +1,6 @@
 ﻿import os
 
-from continual_clip.utils import engine_rerank, tensor2numpy
+from continual_clip.utils import engine_rerank
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import json
 import pdb
@@ -65,7 +65,7 @@ def run_class_incremental(cfg, device):
         model.train()
 
         trainable_params = list(model.get_trainable_parameters())
-        optimizer = torch.optim.AdamW(trainable_params, lr=0.05, weight_decay=0.05)
+        optimizer = torch.optim.SGD(trainable_params, momentum=0.9, lr=0.05, weight_decay=0.05)
         milestones = cfg.milestones
         epochs = cfg.epochs
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=0)
@@ -141,19 +141,19 @@ def run_class_incremental(cfg, device):
                 outputs, final_image_feas, __, edge_sample_features, pre_image_feas, _raw_image_feas = model(inputs, memory_data=sg_inputs, not_ini=not_ini, edge_sample=edge_sample)
                 
                 # RAPF: calculate loss hinge
-                if edge_sample is not None and edge_sample_features is not None:
-                    edge_sample_features = edge_sample_features / edge_sample_features.norm(dim=-1, keepdim=True)
-                    edge_target_features = model.class_name_features[edge_p_target].type(edge_sample_features.dtype)
-                    edge_target_features = edge_target_features / edge_target_features.norm(dim=-1, keepdim=True)
-                    edge_nearest_class_features = model.class_name_features[edge_n_target].type(edge_sample_features.dtype)
-                    edge_nearest_class_features = edge_nearest_class_features / edge_nearest_class_features.norm(dim=-1, keepdim=True)
-                    loss_hinge = torch.relu(
-                        -(edge_sample_features * edge_target_features.detach()).sum(-1)
-                        + (edge_sample_features * edge_nearest_class_features.detach()).sum(-1)
-                        + 0.1
-                    ).mean()
-                else:
-                    loss_hinge = torch.tensor(0.0, device=device)
+                # if edge_sample is not None and edge_sample_features is not None:
+                #     edge_sample_features = edge_sample_features / edge_sample_features.norm(dim=-1, keepdim=True)
+                #     edge_target_features = model.class_name_features[edge_p_target].type(edge_sample_features.dtype)
+                #     edge_target_features = edge_target_features / edge_target_features.norm(dim=-1, keepdim=True)
+                #     edge_nearest_class_features = model.class_name_features[edge_n_target].type(edge_sample_features.dtype)
+                #     edge_nearest_class_features = edge_nearest_class_features / edge_nearest_class_features.norm(dim=-1, keepdim=True)
+                #     loss_hinge = torch.relu(
+                #         -(edge_sample_features * edge_target_features.detach()).sum(-1)
+                #         + (edge_sample_features * edge_nearest_class_features.detach()).sum(-1)
+                #         + 0.1
+                #     ).mean()
+                # else:
+                #     loss_hinge = torch.tensor(0.0, device=device)
                 
                 # ENGINE: calculate aug-image contrastive loss
                 if model.lambda_img > 0:
@@ -195,13 +195,13 @@ def run_class_incremental(cfg, device):
                 
                 # loss =  loss_ce + loss_hinge  + clip_loss + model.lambda_img * image_aug_loss + model.lambda_txt * ref_text_loss
 
-                loss = clip_loss + model.lambda_img * image_aug_loss + model.lambda_txt * ref_text_loss + loss_hinge
+                loss = clip_loss + model.lambda_img * image_aug_loss + model.lambda_txt * ref_text_loss
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
                 tqdm_loader.set_description(
                     f"Ep {i_epoch + 1}/{cfg.epochs} | clip_loss: {clip_loss.item():.4f} | "
-                    f"Li: {image_aug_loss.item():.4f} | Lt: {ref_text_loss.item():.4f} | Lh: {loss_hinge.item():.4f} | lr: {scheduler.get_last_lr()[0]:.4f}"
+                    f"Li: {image_aug_loss.item():.4f} | Lt: {ref_text_loss.item():.4f} | lr: {scheduler.get_last_lr()[0]:.4f}"
                 )
             
             scheduler.step()
@@ -229,7 +229,7 @@ def run_class_incremental(cfg, device):
         sample_data = torch.cat(sample_data, dim=0)
         sample_after_adapt_feature = torch.cat(sample_after_adapt_feature, dim=0)
         model.analyze_mean_cov(sample_data, sample_target)
-        model.mix_matrix()
+        # model.mix_matrix()
         model.eval()
 
 
@@ -282,7 +282,7 @@ def run_class_incremental(cfg, device):
                 )
                     
             predicts = torch.max(outputs, dim=1)[1]
-            correct += (predicts == targets).sum()
+            correct += (predicts == targets).sum().item()
             total   += targets.size(0)
 
             # ensure cpu for logger
@@ -306,10 +306,10 @@ def run_class_incremental(cfg, device):
         # ----- Train logging -----
         train_acc = 100 * metric_logger.online_accuracy if hasattr(metric_logger, "online_accuracy") else None
         
-        # ----- Append vào danh sách để vẽ acc curve -----
+        # ----- Append -----
         acc_list.append(test_acc)
 
-        # ----- Ghi log -----
+        # ----- Log -----
         with open(cfg.log_path, 'a+') as f:
             f.write(json.dumps({
                 'task': task_id,
