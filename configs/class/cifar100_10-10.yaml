@@ -21,7 +21,7 @@ scenario: class
 dataset: cifar100
 num_workers: 8
 train_batch_size: 64
-epochs: 10
+epochs: 15
 lr: 0.05
 fp16: false
 seed: 1993
@@ -30,7 +30,7 @@ milestones:
 - 10
 beta: 0.5
 mix_bias: 0.6
-threshold: 0.3
+threshold: 0.55
 shrinkage: false
 engine:
   enable_otf: true
