@@ -1,6 +1,6 @@
 ﻿import os
 
-from continual_clip.utils import engine_rerank, tensor2numpy
+from continual_clip.utils import engine_rerank
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import json
 import pdb
@@ -112,6 +112,8 @@ def run_class_incremental(cfg, device):
                         proto = model.prototype[i].to(device).clone()
                         if model.sample_noise > 0:
                             proto = proto + torch.randn_like(proto) * model.sample_noise
+                        sg_inputs.append(sample(model.class_mean_list[i], model.class_cov_list[i], int(10*cfg.beta), shrink=cfg.shrinkage))
+                        sg_targets.append(torch.ones(int(10*cfg.beta), dtype=torch.long, device=device) * i)
                         sg_inputs.append(proto.unsqueeze(0))
                         sg_targets.append(torch.ones(1, dtype=torch.long, device=device) * i)
                     if sg_inputs:
@@ -238,7 +240,6 @@ def run_class_incremental(cfg, device):
         total_labels = model.total_class_names
         print('total labels:', total_labels)
         templates = cfg.engine.templates
-        print('templates used:', templates)
         text_features = []
         with torch.no_grad():
             for l in total_labels:
@@ -293,7 +294,12 @@ def run_class_incremental(cfg, device):
                 
             metric_logger.add([outputs.cpu().argmax(dim=1), targets.cpu(), task_ids_cpu], subset="test")
         
-        test_acc = round((correct * 100.0) / total, 2) if total > 0 else 0.0
+        test_acc = (
+            round((correct.item() * 100.0) / total, 2)
+            if total > 0
+            else 0.0
+        )
+
 
 
         # ----- Test logging -----

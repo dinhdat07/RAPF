@@ -403,8 +403,10 @@ class ClassIncrementalCLIP(nn.Module):
         P_new = U_old.T @ weight_new
         dist = (P_new - torch.diag(S_old) @ V_old).abs()
         mask = dist / dist.max()
+        print("before mix bias:", mask.mean().item())
         mask += self.mix_b
         mask = torch.clamp(mask, max=1)
+        print("after mix bias:", mask.mean().item())
         right = P_new * mask + torch.diag(S_old) @ V_old * (1 - mask)
         weight = U_old @ right
         new_layer.weight.data = weight
