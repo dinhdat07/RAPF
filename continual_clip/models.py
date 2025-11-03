@@ -348,9 +348,6 @@ class ClassIncrementalCLIP(nn.Module):
                 ENGINE_Adapter(512, 256, dropout=dropout_rate).to(self.device).to(dtype=self.dtype)
             )
         
-        # 2. ÁP DỤNG FUSION (Cập nhật Universal Adapter)
-        if len(self.image_injection) > 1:
-            self.mix_matrix()
 
 
     # ... (Các hàm _flatten, _unflatten giữ nguyên) ...
@@ -616,7 +613,7 @@ class ClassIncrementalCLIP(nn.Module):
                 seen.add(s); res.append(s)
         return res
       
-    def _get_text_des(self,dataname='cifar224'):
+    def get_text_des(self,dataname='cifar224'):
         root_path = Path(__file__).resolve().parent.parent
         des_path = root_path / "chat" / f"{dataname}_des.json"
         with open(des_path, 'r') as f:
@@ -633,7 +630,7 @@ class ClassIncrementalCLIP(nn.Module):
         self.new_des_dict = new_des_dict
         return new_des_dict
       
-    def _get_batch_des(self, des_file: Dict[str, List[str]], classnames: Iterable[str]) -> List[str]:
+    def get_batch_des(self, des_file: Dict[str, List[str]], classnames: Iterable[str]) -> List[str]:
         out: List[str] = []
         for cname in classnames:
             cname = normalize_key(cname)
