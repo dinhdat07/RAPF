@@ -13,9 +13,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .utils import get_class_ids_per_task, get_class_names
-
-# --- Lớp MLP_Adapter (Không dùng) ---
+from .utils import get_class_ids_per_task, get_class_names, normalize_key
+    
 class MLP_Adapter(nn.Module):
     def __init__(self, c_in, hidden):
         super(MLP_Adapter, self).__init__()
@@ -175,6 +174,34 @@ class ClassIncrementalCLIP(nn.Module):
         self.class_edge_distance = []
         self.mix_b = cfg.mix_bias
         self.sample_noise = float(getattr(self.engine_cfg, 'sample_noise', 0.25)) if self.engine_cfg else 0.25
+    
+    def visual_forward_(self, image: torch.Tensor):
+        v = self.visual 
+        x = image.to(self.clip_type)
+
+        # patch -> seq
+        x = v.conv1(x)                                  # [B, C, H/patch, W/patch]
+        x = x.reshape(x.shape[0], x.shape[1], -1)       # [B, C, N]
+        x = x.permute(0, 2, 1)                          # [B, N, C]
+
+        # prepend class token + add pos embed
+        class_tok = v.class_embedding.to(x.dtype)       # [C]
+        class_tok = class_tok.expand(x.shape[0], 1, -1) # [B, 1, C]
+        x = torch.cat([class_tok, x], dim=1)            # [B, 1+N, C]
+        x = x + v.positional_embedding.to(x.dtype)      # [B, 1+N, C]
+
+        # LN + Transformer (openai/clip ViT expect [B, seq, C] -> they internally permute)
+        x = v.ln_pre(x)
+        x = x.permute(1, 0, 2)                          # [seq, B, C]
+        x = v.transformer(x)
+        x = x.permute(1, 0, 2)                          # [B, seq, C]
+
+        # LN post, class token (pre-projection)
+        x = v.ln_post(x)                                # [B, seq, C]
+        pooled = x[:, 0, :]                             # [B, C]  (pre-proj)
+        
+        return pooled
+
 
 
     # ... (Hàm update_stat giữ nguyên) ...
@@ -185,7 +212,9 @@ class ClassIncrementalCLIP(nn.Module):
             labels = []
             for images, targets, _ in train_loader:
                 images, targets = images.to(device), targets.to(device)
-                image_features = self.encode_image(images).float()
+                image_features = self.visual_forward_(images).float()
+
+                # normalize vector
                 image_features = image_features / image_features.norm(dim=-1, keepdim=True)
                 vecs.append(image_features)
                 labels.append(targets)
@@ -239,8 +268,6 @@ class ClassIncrementalCLIP(nn.Module):
             self.W = torch.einsum('nd,dc->cn', self.mu, self.cov_inv)
             self.b = ps.log() - 0.5 * torch.einsum('nd,dc,nc->n', self.mu, self.cov_inv, self.mu)
 
-    
-    # ... (Hàm get_trainable_parameters giữ nguyên) ...
     def get_trainable_parameters(self):
         params = []
         if self.image_injection and len(self.image_injection) > 0:
@@ -571,6 +598,7 @@ class ClassIncrementalCLIP(nn.Module):
             self.class_edge_distance.append((max_distance.mean() - max_distance.min(), max_distance.max() - max_distance.mean(), max_distance.mean()))
             self.class_mean_list.append(mean)
             self.class_cov_list.append(cov)
+
     def _flatten_values(value: Any) -> List[str]:
         out: List[str] = []
         def _walk(x: Any):
@@ -587,70 +615,70 @@ class ClassIncrementalCLIP(nn.Module):
             if s not in seen:
                 seen.add(s); res.append(s)
         return res
+      
     def _get_text_des(self,dataname='cifar224'):
         root_path = Path(__file__).resolve().parent.parent
         des_path = root_path / "chat" / f"{dataname}_des.json"
         with open(des_path, 'r') as f:
             des_dict = json.load(f)
         self.des_dict = des_dict
+
         new_des_dict = {}
         for key, value in des_dict.items():
             new_key_value = []
-            for k, v in value.items():
+            for _, v in value.items():
                 new_key_value.extend(v)
             new_des_dict[key] = new_key_value
+
         self.new_des_dict = new_des_dict
         return new_des_dict
+      
     def _get_batch_des(self, des_file: Dict[str, List[str]], classnames: Iterable[str]) -> List[str]:
         out: List[str] = []
         for cname in classnames:
+            cname = normalize_key(cname)
             descs = des_file.get(cname, [])
             if descs: 
                 out.append(f"{cname} with {random.choice(descs).casefold()}")
-            else:   
+            else:
+                print(f"[WARNING] No description found for class '{cname}'. Using default prompt.")
                 out.append(f"a photo of {cname}")
         return out
-    def rerank(self, des_dict, outputs, image_features_raw, class_names, device, topk=5):
+    
+    def rerank(self, outputs, image_features_raw, device, topk=5):
+        des_dict = self.des_dict
+        class_to_label = self.classes_names
         with torch.no_grad():
-            batch_size = image_features_raw.shape[0]
-            topk_predict = outputs.topk(topk, dim=1)[1]
-            topk_labels = [[class_names[int(label)] for label in pred] for pred in topk_predict]
-            logi_total = torch.zeros(batch_size, topk, dtype=image_features_raw.dtype, device=device)
+            top5_predict = outputs.topk(topk, 1, True, True)[1]
+            top5_predict_labels = [[class_to_label[int(label)] for label in pred] for pred in top5_predict]
+
+            logi = 0
             for _ in range(3):
                 texts = []
-                for b in range(batch_size):
-                    curr_texts = []
-                    for i, main_label in enumerate(topk_labels[b]):
-                        for j, second_label in enumerate(topk_labels[b]):
-                            if i == j:
+                for batch in range(image_features_raw.shape[0]):
+                    for main_label in top5_predict_labels[batch]:
+                        for second_label in top5_predict_labels[batch]:
+                            if main_label == second_label:
                                 continue
-                            main_label_norm = main_label.replace("_", " ")
-                            second_label_norm = second_label.replace("_", " ")
-                            if main_label_norm in des_dict and second_label_norm in des_dict[main_label_norm]:
-                                desc = random.choice(des_dict[main_label_norm][second_label_norm])
-                            elif main_label_norm in des_dict:
-                                desc = random.choice(random.choice(list(des_dict[main_label_norm].values())))
-                            else:
-                                desc = "description"
-                                print(f"[WARNING] Nhãn '{main_label_norm}' không có trong des_dict")  
-                            curr_texts.append(f"{main_label_norm} with {desc.lower()}")
-                    texts.extend(curr_texts)
-                texts_token = self.tokenize(texts).to(device)
-                texts_embed = self.encode_text(texts_token)
-                texts_embed = texts_embed.to(image_features_raw.dtype)
-                texts_embed = texts_embed.reshape(batch_size, topk, topk-1, -1)
-                texts_embed = torch.mean(texts_embed, dim=2)
-                texts_embed = texts_embed / texts_embed.norm(dim=-1, keepdim=True)
-                logits = torch.bmm(image_features_raw.unsqueeze(1), texts_embed.transpose(1,2)).squeeze(1)
-                logi_total += logits
-            logits = logi_total / 3
-            logits = logits.to(outputs.dtype)
-            new_logits = torch.zeros_like(outputs)
-            for i in range(batch_size):
-                new_logits[i, topk_predict[i]] = logits[i]
-            return new_logits
+                            main = normalize_key(main_label)
+                            second = normalize_key(second_label)
+                            texts.append(main_label + ' with ' + random.choice(des_dict[main][second]).lower())
+                
+                texts = self.tokenize(texts).to(device)
+                texts = self.encode_text(texts)
+                texts = texts.reshape(image_features_raw.shape[0], topk, topk-1, -1)
+                texts = torch.mean(texts, dim=2)
+                texts = texts / texts.norm(dim=-1, keepdim=True)
+                logits = [image_features_raw[i] @ texts[i].T for i in range(image_features_raw.shape[0])]
+                logits = torch.stack(logits)
+                logi += logits
 
-# ... (Phần DomainIncrementalCLIP, TaskAgnosticCLIP, load_model giữ nguyên) ...
+            logits = logi/3
+            logits = logits.to(outputs.dtype)  
+            new_logits = torch.zeros_like(outputs)
+            for i in range(image_features_raw.shape[0]):
+                new_logits[i, top5_predict[i]] = logits[i]
+            return new_logits
 
 class DomainIncrementalCLIP(nn.Module):
     def __init__(self, cfg, device, jit=False) -> None:
@@ -673,6 +701,7 @@ class DomainIncrementalCLIP(nn.Module):
 
 class TaskAgnosticCLIP(nn.Module):
     pass
+
 
 def load_model(cfg: DictConfig, device: torch.device) -> nn.Module:
     r"""Load a CLIP model in different continual scenarios.
