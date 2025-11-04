@@ -32,6 +32,8 @@ beta: 0.5
 mix_bias: 0.6
 threshold: 0.55
 shrinkage: false
+orth_lambda: 1e-3     
+orth_decay: 0.95       
 engine:
   enable_otf: true
   otf_text: true

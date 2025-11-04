@@ -272,10 +272,10 @@ class ClassIncrementalCLIP(nn.Module):
         params = []
         if self.image_injection and len(self.image_injection) > 0:
             params.append(self.image_injection[-1].parameters())
-            params.append([self.image_fusion_alpha, self.image_fusion_beta])
+            # params.append([self.image_fusion_alpha, self.image_fusion_beta])
         if self.text_injection and len(self.text_injection) > 0:
             params.append(self.text_injection[-1].parameters())
-            params.append([self.text_fusion_alpha, self.text_fusion_beta])
+            # params.append([self.text_fusion_alpha, self.text_fusion_beta])
         return chain.from_iterable(params)
     
     # ... (Hàm encode_text, encode_image, freeze giữ nguyên) ...
@@ -348,8 +348,6 @@ class ClassIncrementalCLIP(nn.Module):
                 ENGINE_Adapter(512, 256, dropout=dropout_rate).to(self.device).to(dtype=self.dtype)
             )
         
-
-
     # ... (Các hàm _flatten, _unflatten giữ nguyên) ...
     def _flatten_adapter_params(self, adapter):
         params = []
@@ -369,110 +367,143 @@ class ClassIncrementalCLIP(nn.Module):
                 pointer += num_elements
         return adapter
 
-    # --- HÀM mix_matrix ĐÃ SỬA ---
     def mix_matrix(self):
-        # 1. Fusion Image Adapter
         if len(self.image_injection) < 1:
             return 
-            
-        all_flat_vectors = []
-        for adapter in self.image_injection: 
-            all_flat_vectors.append(self._flatten_adapter_params(adapter))
-            
-        v_uni_img = torch.stack(all_flat_vectors).mean(dim=0)
 
-        # 2. GÁN v^uni CHO Universal Adapter
+        v_uni_img = self.fuse_sign_max(self.image_injection)
         self._unflatten_adapter_params(self.uni_image_adapter, v_uni_img)
-        # --- SỬA LỖI 1: Đã xóa dòng ghi đè adapter mới nhất ---
-        # self._unflatten_adapter_params(self.image_injection[-1], v_uni_img) 
-        self.freeze(self.uni_image_adapter) 
+        self.freeze(self.uni_image_adapter)
 
-        # 3. Fusion Text Adapter
-        all_flat_vectors = []
-        for adapter in self.text_injection:
-            all_flat_vectors.append(self._flatten_adapter_params(adapter))
-        
-        v_uni_txt = torch.stack(all_flat_vectors).mean(dim=0)
-        
+        v_uni_txt = self.fuse_sign_max(self.text_injection)
         self._unflatten_adapter_params(self.uni_text_adapter, v_uni_txt)
-        # --- SỬA LỖI 1: Đã xóa dòng ghi đè adapter mới nhất ---
-        # self._unflatten_adapter_params(self.text_injection[-1], v_uni_txt) 
         self.freeze(self.uni_text_adapter)
 
+    def fuse_sign_max(self, adapters):
+        vecs = torch.stack([self._flatten_adapter_params(a) for a in adapters])  # [N, P]
+        s_uni = torch.sign(vecs.sum(dim=0))                                      # [P]
+        same_sign = torch.sign(vecs) == s_uni.unsqueeze(0)                       # [N, P]
+        masked = torch.where(same_sign, vecs.abs(), torch.zeros_like(vecs))
+        m_uni = masked.max(dim=0).values                                         # [P]
+        v_uni = s_uni * m_uni
+        return v_uni
 
-    # ... (Các hàm apply_image_injection, apply_text_injection giữ nguyên) ...
-    def apply_image_injection(self, features: torch.Tensor, is_old=False) -> torch.Tensor:
+    def _orthogonal_group_loss(self, adapters, norm: str = "l1", eps: float = 1e-8):
+        if len(adapters) <= 1:
+            return torch.zeros((), device=self.device)
+
+        W_new = adapters[-1].up_proj.weight  # [d, r]
+        loss = torch.zeros((), device=W_new.device, dtype=W_new.dtype)
+
+        for prev in adapters[:-1]:
+            W_prev = prev.up_proj.weight  
+            A = W_new @ W_prev.t() 
+
+            if norm == "l1":
+                loss = loss + A.abs().sum()
+            elif norm == "fro2":
+                loss = loss + (A * A).sum()
+            elif norm == "cos":
+                Wn = torch.nn.functional.normalize(W_new, dim=1, eps=eps)
+                Wp = torch.nn.functional.normalize(W_prev, dim=1, eps=eps)
+                C = Wn @ Wp.t()
+                loss = loss + C.abs().mean()
+            else:
+                raise ValueError("norm must be one of {'l1','fro2','cos'}")
+
+        num_prev = len(adapters) - 1
+        if norm in ("l1", "fro2"):
+            d = W_new.shape[0]
+            loss = loss / (num_prev * d * d)
+        else: 
+            loss = loss / num_prev
+
+        return loss
+
+    def orthogonal_loss(self):
+        return self._orthogonal_group_loss(self.image_injection, norm="l1") + \
+            self._orthogonal_group_loss(self.text_injection,  norm="l1")
+
+    def apply_image_injection(self, features: torch.Tensor, mode="infer") -> torch.Tensor:
         if len(self.image_injection) == 0:
             return features
 
-        device = features.device 
-        
         try:
             target_dtype = next(self.image_injection[0].parameters()).dtype
         except StopIteration:
             target_dtype = features.dtype
-            
         features = features.to(dtype=target_dtype)
-        
+
+        if mode == "train":
+            return self.image_injection[-1](features)
+
+        task_output = self._select_adapter_by_entropy(self.image_injection, self.uni_image_adapter, features)
         uni_output = self.uni_image_adapter(features)
-        task_output = self.image_injection[-1](features)
+        return uni_output + task_output
 
-        alpha = self.image_fusion_alpha.to(device)
-        beta = self.image_fusion_beta.to(device)
-        
-        fusion_weights = torch.stack([alpha, beta], dim=0)
-        normalized_weights = F.softmax(fusion_weights, dim=0)
-        alpha_hat, beta_hat = normalized_weights[0], normalized_weights[1]
 
-        outputs = (alpha_hat * uni_output) + (beta_hat * task_output)
-        
-        return outputs
-
-    def apply_text_injection(self, features: torch.Tensor) -> torch.Tensor:
+    def apply_text_injection(self, features: torch.Tensor, mode="infer") -> torch.Tensor:
         if len(self.text_injection) == 0:
             return features
-                    
-        device = features.device
-        
+
         try:
             target_dtype = next(self.text_injection[0].parameters()).dtype
         except StopIteration:
             target_dtype = features.dtype
-            
         features = features.to(dtype=target_dtype)
+
+        if mode == "train":
+            return self.text_injection[-1](features)
+    
+        task_output = self._select_adapter_by_entropy(self.text_injection, self.uni_text_adapter, features)
+        uni_output  = self.uni_text_adapter(features)
+        return uni_output + task_output
+    
+    def _select_adapter_by_entropy(self, adapters, uni_adapter, features):
+        if len(adapters) == 1:
+            return adapters[0](features)
         
-        uni_output = self.uni_text_adapter(features)
-        task_output = self.text_injection[-1](features)
+        uni_out = uni_adapter(features)
 
-        alpha = self.text_fusion_alpha.to(device)
-        beta = self.text_fusion_beta.to(device)
+        entropies = []
+        outputs = []
+        for a in adapters:
+            out = a(features)
+            outputs.append(out)
+            logits = self._logits_from_features(out + uni_out)
+            entropies.append(self._entropy_from_logits(logits))
 
-        fusion_weights = torch.stack([alpha, beta], dim=0)
-        normalized_weights = F.softmax(fusion_weights, dim=0)
-        alpha_hat, beta_hat = normalized_weights[0], normalized_weights[1]
-
-        outputs = (alpha_hat * uni_output) + (beta_hat * task_output)
-                    
-        return outputs
+        best_idx = int(torch.stack(entropies).argmin().item())
+        return outputs[best_idx]
     
+    def _logits_from_features(self, feats: torch.Tensor) -> torch.Tensor:
+        W = self.class_name_features.to(device=feats.device, dtype=feats.dtype)  # [K, C]
+        feats = feats / feats.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+        W = W / W.norm(dim=-1, keepdim=True).clamp_min(1e-12)
 
-    # ... (Các hàm còn lại giữ nguyên) ...
+        scale = self.logit_scale.exp().to(dtype=feats.dtype, device=feats.device)
+        return scale * (feats @ W.t())
     
+    @staticmethod
+    def _entropy_from_logits(logits: torch.Tensor) -> torch.Tensor:
+        p = F.softmax(logits, dim=-1).clamp_min(1e-12)
+        return -(p * p.log()).sum(dim=-1).mean()
+
+
     @torch.no_grad()
     def get_class_name_features(self):
-        class_name_features = self.encode_text(self.text_tokens)
+        class_name_features = self.encode_text(self.text_tokens)  # [K or K*T, C]
         templates_per_class = getattr(self, "templates_per_class", 1)
         if templates_per_class > 1:
             num_classes = len(self.total_class_names)
-            class_name_features = class_name_features.view(
-                num_classes, templates_per_class, -1
-            )
-            class_name_features = class_name_features / class_name_features.norm(
-                dim=-1, keepdim=True
-            )
+            class_name_features = class_name_features.view(num_classes, templates_per_class, -1)
+            class_name_features = class_name_features / class_name_features.norm(dim=-1, keepdim=True).clamp_min(1e-12)
             class_name_features = class_name_features.mean(dim=1)
-        return class_name_features.type(torch.float32)
+        else:
+            class_name_features = class_name_features / class_name_features.norm(dim=-1, keepdim=True).clamp_min(1e-12)
 
+        return class_name_features.to(dtype=torch.float32)
+    
     def adaptation(self, task_id, threshold=0):
         self.known_classes = len(self.total_class_names)
         self.total_class_names += get_class_names(self.classes_names, self.class_ids_per_task[task_id])
@@ -505,7 +536,7 @@ class ClassIncrementalCLIP(nn.Module):
             self.hard_pairs = indices
             self.hard_pairs[:,1] = self.hard_pairs[:,1]+self.cfg.initial_increment+(task_id-1) * self.cfg.increment
 
-    def forward(self, image, ori_ima_f=False, memory_data=None, not_ini=False, edge_sample=None):
+    def forward(self, image, ori_ima_f=False, memory_data=None, not_ini=False, edge_sample=None, mode="train"):
         
         image = image.type(self.dtype)
 
@@ -515,12 +546,12 @@ class ClassIncrementalCLIP(nn.Module):
         original_image_features = clip_features.clone()
         image_features = clip_features
 
-        image_features = self.apply_image_injection(image_features)
+        image_features = self.apply_image_injection(image_features, mode=mode)
         image_features = image_features/image_features.norm(dim=-1, keepdim=True)
         
         if memory_data is not None:
             memory_data = memory_data.type(self.dtype)
-            sg_image_features = self.apply_image_injection(memory_data)
+            sg_image_features = self.apply_image_injection(memory_data, mode=mode)
             sg_image_features = sg_image_features / sg_image_features.norm(dim=-1, keepdim=True)
             img_feas = torch.cat([image_features, sg_image_features], dim=0)
         else:
@@ -530,7 +561,7 @@ class ClassIncrementalCLIP(nn.Module):
         if edge_sample is not None:
             edge_sample = edge_sample.type(self.dtype)
             edge_num = edge_sample.shape[0]
-            edge_sample = self.apply_image_injection(edge_sample)
+            edge_sample = self.apply_image_injection(edge_sample, mode=mode)
             edge_sample = edge_sample / edge_sample.norm(dim=-1, keepdim=True)
             img_feas = torch.cat([img_feas, edge_sample], dim=0)
 
@@ -554,7 +585,7 @@ class ClassIncrementalCLIP(nn.Module):
                 text_features = text_features / text_features.norm(dim=-1, keepdim=True)
                 text_features = text_features.mean(dim=1)
 
-        final_text_feas = self.apply_text_injection(text_features)
+        final_text_feas = self.apply_text_injection(text_features, mode=mode)
         final_text_feas = final_text_feas / final_text_feas.norm(dim=-1, keepdim=True)
 
         #---------- logits ---------
@@ -564,7 +595,7 @@ class ClassIncrementalCLIP(nn.Module):
 
         if not_ini:
             with torch.no_grad():
-                old_memory_feature = self.apply_image_injection(memory_data, is_old=True)
+                old_memory_feature = self.apply_image_injection(memory_data, mode=mode)
                 old_memory_feature = old_memory_feature / old_memory_feature.norm(dim=1, keepdim=True)
             if edge_sample is not None:
                 return probs, final_image_feas, old_memory_feature, edge_sample_features, img_feas, raw_image_features

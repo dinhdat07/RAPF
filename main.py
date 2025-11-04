@@ -45,7 +45,6 @@ def run_class_incremental(cfg, device):
         if getattr(cfg, 'engine_sample_num', None) is not None:
             cfg.engine.sample_num = int(cfg.engine_sample_num)
     
-    # model = load_model(cfg, device)
     model = ClassIncrementalCLIP(cfg, device)
     model.update_injection_units()
 
@@ -141,7 +140,7 @@ def run_class_incremental(cfg, device):
                     not_ini = False
 
 
-                outputs, final_image_feas, __, edge_sample_features, pre_image_feas, _raw_image_feas = model(inputs, memory_data=sg_inputs, not_ini=not_ini, edge_sample=edge_sample)
+                outputs, final_image_feas, __, edge_sample_features, pre_image_feas, _raw_image_feas = model(inputs, memory_data=sg_inputs, not_ini=not_ini, edge_sample=edge_sample, mode="train")
                 
                 # RAPF: calculate loss hinge
                 if task_id>0 and edge_sample is not None and edge_sample_features is not None:
@@ -173,7 +172,7 @@ def run_class_incremental(cfg, device):
                 with torch.no_grad():  
                     clip_tokens = model.tokenize(texts_clip).to(model.device)
                     clip_text_feas = model.encode_text(clip_tokens)
-                clip_text_feas = model.apply_text_injection(clip_text_feas)
+                clip_text_feas = model.apply_text_injection(clip_text_feas, mode="train")
                 clip_text_feas = clip_text_feas /clip_text_feas.norm(dim=-1, keepdim=True)
 
                 if model.lambda_txt > 0:
@@ -198,20 +197,27 @@ def run_class_incremental(cfg, device):
                 
                 # loss =  loss_ce + loss_hinge  + clip_loss + model.lambda_img * image_aug_loss + model.lambda_txt * ref_text_loss
 
-                loss =  clip_loss +  model.lambda_img * image_aug_loss + model.lambda_txt * ref_text_loss + loss_hinge
+                orth_lambda = cfg.orth_lambda * (cfg.orth_decay ** i_epoch)
+                orth_loss = torch.tensor(0.0, device=device)
+                if len(model.image_injection) > 1:
+                    orth_loss = model.orthogonal_loss()
+
+                loss =  clip_loss + model.lambda_img * image_aug_loss + model.lambda_txt * ref_text_loss + loss_hinge + orth_lambda * orth_loss
+
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
                 tqdm_loader.set_description(
-                    f"Ep {i_epoch + 1}/{cfg.epochs} | clip_loss: {clip_loss.item():.4f} | "
-                    f"Li: {image_aug_loss.item():.4f} | Lt: {ref_text_loss.item():.4f} | Lh: {loss_hinge.item():.4f} | lr: {scheduler.get_last_lr()[0]:.4f}"
+                    f"Ep {i_epoch + 1}/{cfg.epochs}|Lo: {orth_loss.item():.4f}| "
+                    f"Li: {image_aug_loss.item():.4f}|Lt: {ref_text_loss.item():.4f}|Lh: {loss_hinge.item():.4f}"
+                    f"|lr: {scheduler.get_last_lr()[0]:.4f}"
                 )
             
             scheduler.step()
             for inputs, targets, task_ids in train_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
                 with torch.no_grad():
-                    outputs, *_ = model(inputs)
+                    outputs, *_ = model(inputs, mode="train")
                     torch.nn.functional.softmax(outputs, dim=-1)
                     metric_logger.add([outputs.cpu().argmax(dim=1), targets.cpu(), task_ids], subset="train")
         
@@ -224,7 +230,7 @@ def run_class_incremental(cfg, device):
         for input, target, task_ids in tqdm(sample_loader):
             input, target = input.to(device), target.to(device)
             with torch.no_grad():
-                _, ori_ima_feat, after_adapt_feature, *_ = model(input, ori_ima_f=True)
+                _, ori_ima_feat, after_adapt_feature, *_ = model(input, ori_ima_f=True, mode="train")
             sample_data.append(ori_ima_feat)
             sample_target.append(target)
             sample_after_adapt_feature.append(after_adapt_feature)
