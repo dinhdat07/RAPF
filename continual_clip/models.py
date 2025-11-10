@@ -320,10 +320,7 @@ class ClassIncrementalCLIP(nn.Module):
             self.text_injection.append(
                 ENGINE_Adapter(512, 256, dropout=dropout_rate).to(self.device).to(dtype=self.dtype)
             )
-        
-        # 2. ÁP DỤNG FUSION (Cập nhật Universal Adapter)
-        if len(self.image_injection) > 1:
-            self.mix_matrix()
+    
 
 
     # ... (Các hàm _flatten, _unflatten giữ nguyên) ...

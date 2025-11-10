@@ -174,20 +174,20 @@ def run_class_incremental(cfg, device):
                 clip_text_feas = model.apply_text_injection(clip_text_feas)
                 clip_text_feas = clip_text_feas /clip_text_feas.norm(dim=-1, keepdim=True)
 
-                if model.lambda_txt > 0:
-                    repeat_ = 1 
-                    ref_text_loss_list = []
-                    for _ in range(repeat_):
-                        ref_texts = model._get_batch_des(model.new_des_dict, labels)
-                        ref_emb = model.tokenize(ref_texts).to(model.device)
-                        with torch.no_grad():
-                            ref_text_features = model.encode_text(ref_emb)
-                        ref_text_features = ref_text_features.float() 
-                        ref_text_features = ref_text_features / ref_text_features.norm(dim=-1, keepdim=True)
-                        ref_text_loss_list.append(contrastive_loss(clip_text_feas @ ref_text_features.T))
-                    ref_text_loss = sum(ref_text_loss_list) / len(ref_text_loss_list)
-                else:
-                    ref_text_loss = 0
+                # if model.lambda_txt > 0:
+                #     repeat_ = 1 
+                #     ref_text_loss_list = []
+                #     for _ in range(repeat_):
+                #         ref_texts = model._get_batch_des(model.new_des_dict, labels)
+                #         ref_emb = model.tokenize(ref_texts).to(model.device)
+                #         with torch.no_grad():
+                #             ref_text_features = model.encode_text(ref_emb)
+                #         ref_text_features = ref_text_features.float() 
+                #         ref_text_features = ref_text_features / ref_text_features.norm(dim=-1, keepdim=True)
+                #         ref_text_loss_list.append(contrastive_loss(clip_text_feas @ ref_text_features.T))
+                #     ref_text_loss = sum(ref_text_loss_list) / len(ref_text_loss_list)
+                # else:
+                #     ref_text_loss = 0
                 
                 clip_loss=cliploss(final_image_feas, clip_text_feas, model.logit_scale)
 
@@ -196,13 +196,13 @@ def run_class_incremental(cfg, device):
                 
                 # loss =  loss_ce + loss_hinge  + clip_loss + model.lambda_img * image_aug_loss + model.lambda_txt * ref_text_loss
 
-                loss =  clip_loss +  model.lambda_img * image_aug_loss + model.lambda_txt * ref_text_loss + loss_hinge
+                loss =  clip_loss +  model.lambda_img * image_aug_loss + loss_hinge
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
                 tqdm_loader.set_description(
-                    f"Ep {i_epoch + 1}/{cfg.epochs} | L: {loss.item():.4f} | Clip_loss: {clip_loss.item():.4f} | "
-                    f"Li: {image_aug_loss.item():.4f} | Lt: {ref_text_loss.item():.4f} | Lh: {loss_hinge.item():.4f} | lr: {scheduler.get_last_lr()[0]:.4f}"
+                    f"Ep {i_epoch + 1}/{cfg.epochs} | clip_loss: {clip_loss.item():.4f} | "
+                    f"Lh: {loss_hinge.item():.4f} | lr: {scheduler.get_last_lr()[0]:.4f}"
                 )
             
             scheduler.step()
@@ -238,14 +238,14 @@ def run_class_incremental(cfg, device):
             inputs, targets = inputs.to(device), targets.to(device)
             with torch.no_grad():
                 outputs, _, __, ___, _pre_image_feas, raw_image_feas = model(inputs)
-                outputs = engine_rerank(
-                    model=model,
-                    device=device,
-                    epoch=epochs - 1,
-                    cfg=cfg,
-                    outputs=outputs,
-                    raw_image_feas=raw_image_feas,
-                )
+                # outputs = engine_rerank(
+                #     model=model,
+                #     device=device,
+                #     epoch=epochs - 1,
+                #     cfg=cfg,
+                #     outputs=outputs,
+                #     raw_image_feas=raw_image_feas,
+                # )
                 torch.nn.functional.softmax(outputs, dim=-1)
             metric_logger.add([outputs.cpu().argmax(dim=1), targets.cpu(), task_ids], subset="test")
 

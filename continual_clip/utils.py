@@ -76,7 +76,7 @@ def engine_rerank(model, outputs, raw_image_feas, device, epoch, cfg):
     """
     model.eval()
     with torch.no_grad():
-        if hasattr(cfg, "epochs") and epoch == cfg.epochs - 1:
+        if hasattr(cfg, "epochs") and epoch == cfg.epochs:
             # GDA classifier
             outputs_gda = raw_image_feas @ model.W + model.b
             outputs_gda = outputs_gda / outputs_gda.norm(dim=-1, keepdim=True)
