@@ -52,7 +52,8 @@ def run_class_incremental(cfg, device):
     eval_dataset, classes_names = build_cl_scenarios(cfg, is_train=False, base_transforms=model.transforms)
     train_dataset, _ = build_cl_scenarios(cfg, is_train=True, base_transforms=model.transforms)
     model.classes_names = classes_names
-    des_dict =  model._get_text_des(dataname='cifar224') 
+    print(model.classes_names)
+    model.get_text_des(dataname='cifar224') 
     acc_list = []
     metric_logger = Logger(list_subsets=["train", "test"])
 
@@ -72,6 +73,7 @@ def run_class_incremental(cfg, device):
 
         from continual_clip.losses import ClipLoss
         cliploss=ClipLoss()
+
         for i_epoch in range(epochs):
             loss = torch.tensor(0.0).to(device)
             loss_hinge = torch.tensor(0.0, device=device)
@@ -214,7 +216,7 @@ def run_class_incremental(cfg, device):
                     metric_logger.add([outputs.cpu().argmax(dim=1), targets.cpu(), task_ids], subset="train")
         
         
-        sample_loader = DataLoader(train_dataset[task_id], batch_size=128, shuffle=False, num_workers=cfg.num_workers)
+        sample_loader = DataLoader(train_dataset[task_id], batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers)
         sample_data = []
         sample_target = []
         sample_after_adapt_feature = []
@@ -233,8 +235,27 @@ def run_class_incremental(cfg, device):
         model.mix_matrix()
         model.eval()
 
+
         eval_loader = DataLoader(eval_dataset[:task_id + 1], batch_size=cfg.batch_size, num_workers=cfg.num_workers)
-        for inputs, targets, task_ids in eval_loader:
+
+        total_labels = model.total_class_names
+        print('total labels:', total_labels)
+        templates = cfg.engine.templates
+        text_features = []
+        with torch.no_grad():
+            for l in total_labels:
+                texts = [t.format(l) for t in templates]
+                texts = model.tokenize(texts).to(device)
+                class_embeddings = model.encode_text(texts)
+                class_embeddings = model.apply_text_injection(class_embeddings)
+                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
+                class_embeddings = class_embeddings.mean(dim=0)
+                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
+                text_features.append(class_embeddings)
+            text_features = torch.stack(text_features, dim=0)
+            
+        correct, total = 0, 0
+        for i, (inputs, targets, task_ids) in enumerate(eval_loader):
             inputs, targets = inputs.to(device), targets.to(device)
             with torch.no_grad():
                 outputs, _, __, ___, _pre_image_feas, raw_image_feas = model(inputs)
@@ -251,7 +272,6 @@ def run_class_incremental(cfg, device):
 
 
         # ----- Test logging -----
-        test_acc = 100 * metric_logger.accuracy  # accuracy trên test set
         avg_acc = 100 * metric_logger.average_incremental_accuracy
         forgetting_val = 100 * metric_logger.forgetting
         acc_per_task = [round(100 * acc_t, 2) for acc_t in metric_logger.accuracy_per_task]
@@ -260,7 +280,7 @@ def run_class_incremental(cfg, device):
 
         # ----- Train logging -----
         train_acc = 100 * metric_logger.online_accuracy if hasattr(metric_logger, "online_accuracy") else None
-
+        
         # ----- Append vào danh sách để vẽ acc curve -----
         acc_list.append(test_acc)
 
