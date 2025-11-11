@@ -8,6 +8,7 @@ from continuum import ClassIncremental, InstanceIncremental
 from continuum.datasets import (
     CIFAR100, ImageNet100, TinyImageNet200, ImageFolderDataset, Core50,CUB200
 )
+
 from .utils import get_dataset_class_names, get_workdir
 
 from torchvision import transforms

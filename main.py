@@ -52,7 +52,7 @@ def run_class_incremental(cfg, device):
     eval_dataset, classes_names = build_cl_scenarios(cfg, is_train=False, base_transforms=model.transforms)
     train_dataset, _ = build_cl_scenarios(cfg, is_train=True, base_transforms=model.transforms)
     model.classes_names = classes_names
-    des_dict =  model._get_text_des(dataname='cifar224') 
+    des_dict =  model._get_text_des(dataname=cfg.data_name) 
     acc_list = []
     metric_logger = Logger(list_subsets=["train", "test"])
 
@@ -230,7 +230,6 @@ def run_class_incremental(cfg, device):
         sample_data = torch.cat(sample_data, dim=0)
         sample_after_adapt_feature = torch.cat(sample_after_adapt_feature, dim=0)
         model.analyze_mean_cov(sample_data, sample_target)
-        model.mix_matrix()
         model.eval()
 
         eval_loader = DataLoader(eval_dataset[:task_id + 1], batch_size=cfg.batch_size, num_workers=cfg.num_workers)
@@ -306,5 +305,3 @@ def continual_clip(cfg: DictConfig) -> None:
 
 if __name__ == "__main__":
     continual_clip()
-
-

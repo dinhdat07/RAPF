@@ -345,38 +345,30 @@ class ClassIncrementalCLIP(nn.Module):
                 pointer += num_elements
         return adapter
 
-    # --- HÀM mix_matrix ĐÃ SỬA ---
     def mix_matrix(self):
-        # 1. Fusion Image Adapter
-        if len(self.image_injection) < 1:
-            return 
-            
-        all_flat_vectors = []
-        for adapter in self.image_injection: 
-            all_flat_vectors.append(self._flatten_adapter_params(adapter))
-            
-        v_uni_img = torch.stack(all_flat_vectors).mean(dim=0)
+            adapters_to_mix_img = self.image_injection
+            if len(adapters_to_mix_img) < 1: 
+                return 
+                
+            all_flat_vectors = []
+            for adapter in adapters_to_mix_img: 
+                all_flat_vectors.append(self._flatten_adapter_params(adapter))
+            v_uni_img = torch.stack(all_flat_vectors).mean(dim=0)
+            self._unflatten_adapter_params(self.uni_image_adapter, v_uni_img)
+            self.freeze(self.uni_image_adapter) 
 
-        # 2. GÁN v^uni CHO Universal Adapter
-        self._unflatten_adapter_params(self.uni_image_adapter, v_uni_img)
-        # --- SỬA LỖI 1: Đã xóa dòng ghi đè adapter mới nhất ---
-        # self._unflatten_adapter_params(self.image_injection[-1], v_uni_img) 
-        self.freeze(self.uni_image_adapter) 
-
-        # 3. Fusion Text Adapter
-        all_flat_vectors = []
-        for adapter in self.text_injection:
-            all_flat_vectors.append(self._flatten_adapter_params(adapter))
-        
-        v_uni_txt = torch.stack(all_flat_vectors).mean(dim=0)
-        
-        self._unflatten_adapter_params(self.uni_text_adapter, v_uni_txt)
-        # --- SỬA LỖI 1: Đã xóa dòng ghi đè adapter mới nhất ---
-        # self._unflatten_adapter_params(self.text_injection[-1], v_uni_txt) 
-        self.freeze(self.uni_text_adapter)
+            # 3. Fusion Text Adapter
+            adapters_to_mix_txt = self.text_injection
+            if len(adapters_to_mix_txt) < 1:
+                return
+            all_flat_vectors = []
+            for adapter in adapters_to_mix_txt:
+                all_flat_vectors.append(self._flatten_adapter_params(adapter))           
+            v_uni_txt = torch.stack(all_flat_vectors).mean(dim=0)            
+            self._unflatten_adapter_params(self.uni_text_adapter, v_uni_txt)
+            self.freeze(self.uni_text_adapter)
 
 
-    # ... (Các hàm apply_image_injection, apply_text_injection giữ nguyên) ...
     def apply_image_injection(self, features: torch.Tensor, is_old=False) -> torch.Tensor:
         if len(self.image_injection) == 0:
             return features
@@ -650,7 +642,7 @@ class ClassIncrementalCLIP(nn.Module):
                 new_logits[i, topk_predict[i]] = logits[i]
             return new_logits
 
-# ... (Phần DomainIncrementalCLIP, TaskAgnosticCLIP, load_model giữ nguyên) ...
+
 
 class DomainIncrementalCLIP(nn.Module):
     def __init__(self, cfg, device, jit=False) -> None:
