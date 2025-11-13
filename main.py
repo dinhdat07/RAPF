@@ -1,6 +1,5 @@
 ﻿import os
 
-from continual_clip.utils import engine_rerank
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import json
 import pdb
@@ -17,8 +16,8 @@ from continuum.metrics import Logger
 
 from tqdm import tqdm
 from continual_clip import utils
-from continual_clip.models import ClassIncrementalCLIP, load_model, sample
-from continual_clip.losses import contrastive_loss, engine_contrastive_loss
+from continual_clip.models import ClassIncrementalCLIP, load_model
+from continual_clip.losses import contrastive_loss
 from continual_clip.datasets import build_cl_scenarios
 import numpy as np
 
@@ -45,7 +44,6 @@ def run_class_incremental(cfg, device):
         if getattr(cfg, 'engine_sample_num', None) is not None:
             cfg.engine.sample_num = int(cfg.engine_sample_num)
     
-    # model = load_model(cfg, device)
     model = ClassIncrementalCLIP(cfg, device)
     model.update_injection_units()
 
@@ -53,7 +51,6 @@ def run_class_incremental(cfg, device):
     train_dataset, _ = build_cl_scenarios(cfg, is_train=True, base_transforms=model.transforms)
     model.classes_names = classes_names
     print(model.classes_names)
-    model.get_text_des(dataname='cifar224') 
     acc_list = []
     metric_logger = Logger(list_subsets=["train", "test"])
 
@@ -113,7 +110,7 @@ def run_class_incremental(cfg, device):
                         proto = model.prototype[i].to(device).clone()
                         if model.sample_noise > 0:
                             proto = proto + torch.randn_like(proto) * model.sample_noise
-                        sg_inputs.append(sample(model.class_mean_list[i], model.class_cov_list[i],int(10*cfg.beta), shrink=cfg.shrinkage))
+                        sg_inputs.append(utils.sample(model.class_mean_list[i], model.class_cov_list[i],int(10*cfg.beta), shrink=cfg.shrinkage))
                         sg_targets.append(torch.ones(int(10*cfg.beta), dtype=torch.long, device=device)*i)
                         sg_inputs.append(proto.unsqueeze(0))
                         sg_targets.append(torch.ones(1, dtype=torch.long, device=device) * i)
@@ -129,7 +126,7 @@ def run_class_incremental(cfg, device):
                     edge_p_target = []
                     edge_n_target = []
                     for hard_pair in model.hard_pairs:
-                        edge_sample.append(sample(model.class_mean_list[hard_pair[0]], model.class_cov_list[hard_pair[0]],int(20*cfg.beta), shrink=cfg.shrinkage))
+                        edge_sample.append(utils.sample(model.class_mean_list[hard_pair[0]], model.class_cov_list[hard_pair[0]],int(20*cfg.beta), shrink=cfg.shrinkage))
                         edge_p_target.append(torch.ones(int(20*cfg.beta), dtype=torch.long, device=device)*hard_pair[0])
                         edge_n_target.append(torch.ones(int(20*cfg.beta), dtype=torch.long, device=device)*hard_pair[1])
                     edge_sample = torch.cat(edge_sample, dim=0)
@@ -167,7 +164,7 @@ def run_class_incremental(cfg, device):
                     sim_img = final_image_feas[:aug_feas.shape[0]] @ aug_feas.T
                     image_aug_loss = contrastive_loss(sim_img)
 
-                # ENGINE: get text features by targets and calculate text-des loss
+                # ENGINE: get text features by targets
                 labels = [model.total_class_names[int(y)] for y in targets.tolist()]
                 texts_clip=[model.prompt_template.format(inst) for inst in labels]
                 with torch.no_grad():  
@@ -175,28 +172,8 @@ def run_class_incremental(cfg, device):
                     clip_text_feas = model.encode_text(clip_tokens)
                 clip_text_feas = model.apply_text_injection(clip_text_feas)
                 clip_text_feas = clip_text_feas /clip_text_feas.norm(dim=-1, keepdim=True)
-
-                # if model.lambda_txt > 0:
-                #     repeat_ = 1 
-                #     ref_text_loss_list = []
-                #     for _ in range(repeat_):
-                #         ref_texts = model._get_batch_des(model.new_des_dict, labels)
-                #         ref_emb = model.tokenize(ref_texts).to(model.device)
-                #         with torch.no_grad():
-                #             ref_text_features = model.encode_text(ref_emb)
-                #         ref_text_features = ref_text_features.float() 
-                #         ref_text_features = ref_text_features / ref_text_features.norm(dim=-1, keepdim=True)
-                #         ref_text_loss_list.append(contrastive_loss(clip_text_feas @ ref_text_features.T))
-                #     ref_text_loss = sum(ref_text_loss_list) / len(ref_text_loss_list)
-                # else:
-                #     ref_text_loss = 0
                 
                 clip_loss=cliploss(final_image_feas, clip_text_feas, model.logit_scale)
-
-                # RAPF: calculate contrastive loss
-                # loss_ce = F.cross_entropy(outputs, targets.detach())
-                
-                # loss =  loss_ce + loss_hinge  + clip_loss + model.lambda_img * image_aug_loss + model.lambda_txt * ref_text_loss
 
                 loss =  clip_loss +  model.lambda_img * image_aug_loss + loss_hinge
                 loss.backward()
@@ -215,7 +192,7 @@ def run_class_incremental(cfg, device):
                     torch.nn.functional.softmax(outputs, dim=-1)
                     metric_logger.add([outputs.cpu().argmax(dim=1), targets.cpu(), task_ids], subset="train")
         
-        
+
         sample_loader = DataLoader(train_dataset[task_id], batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers)
         sample_data = []
         sample_target = []
@@ -232,46 +209,22 @@ def run_class_incremental(cfg, device):
         sample_data = torch.cat(sample_data, dim=0)
         sample_after_adapt_feature = torch.cat(sample_after_adapt_feature, dim=0)
         model.analyze_mean_cov(sample_data, sample_target)
-        model.mix_matrix()
+        model.update_uni_with_fisher_ema(train_loader, max_batches=2)
         model.eval()
 
 
         eval_loader = DataLoader(eval_dataset[:task_id + 1], batch_size=cfg.batch_size, num_workers=cfg.num_workers)
-
-        total_labels = model.total_class_names
-        print('total labels:', total_labels)
-        templates = cfg.engine.templates
-        text_features = []
-        with torch.no_grad():
-            for l in total_labels:
-                texts = [t.format(l) for t in templates]
-                texts = model.tokenize(texts).to(device)
-                class_embeddings = model.encode_text(texts)
-                class_embeddings = model.apply_text_injection(class_embeddings)
-                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
-                class_embeddings = class_embeddings.mean(dim=0)
-                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
-                text_features.append(class_embeddings)
-            text_features = torch.stack(text_features, dim=0)
             
-        correct, total = 0, 0
         for i, (inputs, targets, task_ids) in enumerate(eval_loader):
             inputs, targets = inputs.to(device), targets.to(device)
             with torch.no_grad():
                 outputs, _, __, ___, _pre_image_feas, raw_image_feas = model(inputs)
-                # outputs = engine_rerank(
-                #     model=model,
-                #     device=device,
-                #     epoch=epochs - 1,
-                #     cfg=cfg,
-                #     outputs=outputs,
-                #     raw_image_feas=raw_image_feas,
-                # )
                 torch.nn.functional.softmax(outputs, dim=-1)
             metric_logger.add([outputs.cpu().argmax(dim=1), targets.cpu(), task_ids], subset="test")
-
+    
 
         # ----- Test logging -----
+        test_acc = 100 * metric_logger.accuracy
         avg_acc = 100 * metric_logger.average_incremental_accuracy
         forgetting_val = 100 * metric_logger.forgetting
         acc_per_task = [round(100 * acc_t, 2) for acc_t in metric_logger.accuracy_per_task]
@@ -280,11 +233,8 @@ def run_class_incremental(cfg, device):
 
         # ----- Train logging -----
         train_acc = 100 * metric_logger.online_accuracy if hasattr(metric_logger, "online_accuracy") else None
-        
-        # ----- Append vào danh sách để vẽ acc curve -----
         acc_list.append(test_acc)
 
-        # ----- Ghi log -----
         with open(cfg.log_path, 'a+') as f:
             f.write(json.dumps({
                 'task': task_id,
@@ -305,9 +255,6 @@ def run_class_incremental(cfg, device):
         }) + '\n')
 
 
-
-
-
 @hydra.main(config_path=None, config_name=None, version_base="1.1") 
 def continual_clip(cfg: DictConfig) -> None:
     seed_everything(cfg.seed)
@@ -322,7 +269,6 @@ def continual_clip(cfg: DictConfig) -> None:
     if cfg.scenario == "class":
         run_class_incremental(cfg, device)
 
-    
 
 if __name__ == "__main__":
     continual_clip()

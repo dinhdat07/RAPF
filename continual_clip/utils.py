@@ -87,3 +87,26 @@ def engine_rerank(model, outputs, raw_image_feas, device, cfg):
         )
 
     return outputs
+
+
+def shrink_cov(cov):
+    diag_mean = torch.mean(torch.diagonal(cov))
+    off_diag = cov.clone()
+    off_diag.fill_diagonal_(0.0)
+    mask = off_diag != 0.0
+    off_diag_mean = (off_diag*mask).sum() / mask.sum()
+    iden = torch.eye(cov.shape[0], device=cov.device)
+    alpha1 = 1
+    alpha2  = 1
+    cov_ = cov + (alpha1*diag_mean*iden) + (alpha2*off_diag_mean*(1-iden))
+    return cov_
+
+
+def sample(mean, cov, size, shrink=False):
+    vec = torch.randn(size, mean.shape[-1], device=mean.device)
+    if shrink:
+        cov = shrink_cov(cov)
+    sqrt_cov = torch.linalg.cholesky(cov)
+    vec = vec @ sqrt_cov.t()
+    vec = vec + mean
+    return vec
