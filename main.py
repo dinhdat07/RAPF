@@ -259,19 +259,12 @@ def run_class_incremental(cfg, device):
             inputs, targets = inputs.to(device), targets.to(device)
             with torch.no_grad():
                 outputs, _, __, ___, _pre_image_feas, raw_image_feas = model(inputs)
-                # outputs = engine_rerank(
-                #     model=model,
-                #     device=device,
-                #     epoch=epochs - 1,
-                #     cfg=cfg,
-                #     outputs=outputs,
-                #     raw_image_feas=raw_image_feas,
-                # )
                 torch.nn.functional.softmax(outputs, dim=-1)
             metric_logger.add([outputs.cpu().argmax(dim=1), targets.cpu(), task_ids], subset="test")
 
 
         # ----- Test logging -----
+        test_acc = 100 * metric_logger.accuracy
         avg_acc = 100 * metric_logger.average_incremental_accuracy
         forgetting_val = 100 * metric_logger.forgetting
         acc_per_task = [round(100 * acc_t, 2) for acc_t in metric_logger.accuracy_per_task]
