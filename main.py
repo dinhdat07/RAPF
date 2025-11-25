@@ -45,7 +45,6 @@ def run_class_incremental(cfg, device):
             cfg.engine.sample_num = int(cfg.engine_sample_num)
     
     model = ClassIncrementalCLIP(cfg, device)
-    model.update_injection_units()
 
     eval_dataset, classes_names = build_cl_scenarios(cfg, is_train=False, base_transforms=model.transforms)
     train_dataset, _ = build_cl_scenarios(cfg, is_train=True, base_transforms=model.transforms)
@@ -62,11 +61,19 @@ def run_class_incremental(cfg, device):
         model.update_stat(known_classes=model.known_classes,total_classes=len(model.total_class_names),train_loader=train_loader,device=device) 
         model.train()
 
-        trainable_params = list(model.get_trainable_parameters())
-        optimizer = torch.optim.AdamW(trainable_params, lr=cfg.lr, weight_decay=0.05)
-        milestones = cfg.milestones
         epochs = cfg.epochs
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=0)
+        adapter_params = [p for p in model.get_trainable_parameters(include_gate=False)]
+        gate_params = [p for p in model.gate_img.parameters() if p.requires_grad] + \
+                    [p for p in model.gate_txt.parameters() if p.requires_grad]
+
+        adapter_lr = getattr(cfg, "adapter_lr", cfg.lr)
+        gate_lr = getattr(cfg, "gate_lr", adapter_lr * 0.5)
+        weight_decay = getattr(cfg, "weight_decay", 0.05)
+
+        # optimizer only for adapter (warm-up phase)
+        optimizer = torch.optim.AdamW([{'params': adapter_params, 'lr': adapter_lr, 'weight_decay': weight_decay}])
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=0.0)
+        warmup_epochs = getattr(cfg, "warmup_epochs", 2)
 
         from continual_clip.losses import ClipLoss
         cliploss=ClipLoss()
@@ -191,6 +198,10 @@ def run_class_incremental(cfg, device):
                     outputs, *_ = model(inputs)
                     torch.nn.functional.softmax(outputs, dim=-1)
                     metric_logger.add([outputs.cpu().argmax(dim=1), targets.cpu(), task_ids], subset="train")
+            
+            if i_epoch + 1 == warmup_epochs and len(gate_params) > 0:
+                optimizer.add_param_group({'params': gate_params, 'lr': gate_lr, 'weight_decay': weight_decay})
+                print(f"Added gate params to optimizer at epoch {i_epoch+1}")
         
 
         sample_loader = DataLoader(train_dataset[task_id], batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers)
@@ -209,7 +220,6 @@ def run_class_incremental(cfg, device):
         sample_data = torch.cat(sample_data, dim=0)
         sample_after_adapt_feature = torch.cat(sample_after_adapt_feature, dim=0)
         model.analyze_mean_cov(sample_data, sample_target)
-        model.update_uni_with_fisher_ema(train_loader, max_batches=2)
         model.eval()
 
 
