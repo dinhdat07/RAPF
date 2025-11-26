@@ -61,29 +61,3 @@ def get_engine_descriptor_path(workdir: str, dataset_name: str) -> Optional[str]
 def normalize_key(name: str):
     return name.replace("_", " ").lower()
 
-def engine_rerank(model, outputs, raw_image_feas, device, cfg):
-
-    with torch.no_grad():
-        if hasattr(cfg, "epochs") and epoch == cfg.epochs:
-            # GDA classifier
-            outputs_gda = raw_image_feas @ model.W + model.b
-            outputs_gda = outputs_gda / outputs_gda.norm(dim=-1, keepdim=True)
-
-        # Rerank batch
-        outputs_rerank = model.rerank(
-            des_dict=model.des_dict,
-            outputs=outputs,
-            image_features_raw=raw_image_feas,
-            class_names=model.total_class_names,
-            device=device,
-            topk=cfg.engine.topk
-        )
-
-        # GDA + rerank + original outputs
-        outputs = (
-            outputs_gda * cfg.engine.stat
-            + (cfg.engine.rerank * outputs_rerank
-                + (1 - cfg.engine.rerank) * outputs) * (1 - cfg.engine.stat)
-        )
-
-    return outputs

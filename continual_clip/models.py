@@ -145,16 +145,8 @@ class ClassIncrementalCLIP(nn.Module):
 
         # --- SỬ DỤNG LẠI ENGINE_Adapter (đã cải tiến) ---
         dropout_rate = float(getattr(cfg, 'dropout', 0.1))
-        self.uni_image_adapter = ENGINE_Adapter(512, 256, dropout=dropout_rate).to(self.device).to(dtype=self.dtype)
-        self.uni_text_adapter = ENGINE_Adapter(512, 256, dropout=dropout_rate).to(self.device).to(dtype=self.dtype)
-        self.freeze(self.uni_image_adapter)
-        self.freeze(self.uni_text_adapter)
-
-        self.image_fusion_alpha = nn.Parameter(torch.ones(1)) 
-        self.image_fusion_beta = nn.Parameter(torch.ones(1)) 
-        
-        self.text_fusion_alpha = nn.Parameter(torch.ones(1))
-        self.text_fusion_beta = nn.Parameter(torch.ones(1))
+        self.uni_image_adapter = None
+        self.uni_text_adapter = None
 
         # ... (Phần còn lại của __init__ giữ nguyên) ...
         self.engine_cfg = getattr(cfg, 'engine', None)
@@ -163,10 +155,9 @@ class ClassIncrementalCLIP(nn.Module):
         self.replay_alpha = float(getattr(self.engine_cfg, 'replay_alpha', 0.0)) if self.engine_cfg else 0.0
         self.replay_sample_num = int(getattr(self.engine_cfg, 'sample_num', 0)) if self.engine_cfg else 0
         self.image_injection = nn.ModuleList()
-        self.prev_image_injection = None
         self.text_injection = nn.ModuleList()
-        self.prev_text_injection = None
-        self.new_des_dict = {}
+
+
         self.prototype: List[torch.Tensor] = []
         self.class_mean_list = []
         self.class_cov_list = []
@@ -245,10 +236,8 @@ class ClassIncrementalCLIP(nn.Module):
         params = []
         if self.image_injection and len(self.image_injection) > 0:
             params.append(self.image_injection[-1].parameters())
-            params.append([self.image_fusion_alpha, self.image_fusion_beta])
         if self.text_injection and len(self.text_injection) > 0:
             params.append(self.text_injection[-1].parameters())
-            params.append([self.text_fusion_alpha, self.text_fusion_beta])
         return chain.from_iterable(params)
     
     # ... (Hàm encode_text, encode_image, freeze giữ nguyên) ...
@@ -271,8 +260,16 @@ class ClassIncrementalCLIP(nn.Module):
             param.requires_grad = False
 
     # --- HÀM update_injection_units ĐÃ SỬA ---
-    def update_injection_units(self, noise_std: float = 0.01):
-        
+    def update_injection_units(self, task_id):
+        if task_id == 1:
+            self.uni_image_adapter = copy.deepcopy(self.image_injection[0])
+            self.uni_text_adapter = copy.deepcopy(self.text_injection[0])
+            
+            self.uni_image_adapter.to(self.device)
+            self.uni_text_adapter.to(self.device)
+            self.freeze(self.uni_image_adapter)
+            self.freeze(self.uni_text_adapter)
+
         for inj in self.image_injection: 
             self.freeze(inj)
         for inj in self.text_injection:
@@ -282,48 +279,28 @@ class ClassIncrementalCLIP(nn.Module):
 
         # --- IMAGE ADAPTER ---
         if self.image_injection:
-            # 1. Deepcopy
             new_image_adapter = copy.deepcopy(self.image_injection[-1])
-            for param in new_image_adapter.parameters():
-                # Thêm nhiễu
-                param.data += noise_std * torch.randn_like(param.data)
-                param.requires_grad = True 
-            
-            # --- SỬA LỖI 2: Reset scale ---
-            if hasattr(new_image_adapter, 'scale'):
-                with torch.no_grad():
-                    new_image_adapter.scale.fill_(1.0) # Reset về 1.0
-            
+            for p in new_image_adapter.parameters():
+                p.requires_grad = True
             self.image_injection.append(new_image_adapter.to(self.device).to(dtype=self.dtype))
         else:
-            # --- SỬ DỤNG LẠI ENGINE_Adapter ---
             self.image_injection.append(
                 ENGINE_Adapter(512, 256, dropout=dropout_rate).to(self.device).to(dtype=self.dtype)
             )
 
         # --- TEXT ADAPTER ---
         if self.text_injection:
-            # 1. Deepcopy
             new_text_adapter = copy.deepcopy(self.text_injection[-1])
-            for param in new_text_adapter.parameters():
-                param.data += noise_std * torch.randn_like(param.data)
-                param.requires_grad = True
-            
-            # --- SỬA LỖI 2: Reset scale ---
-            if hasattr(new_text_adapter, 'scale'):
-                with torch.no_grad():
-                    new_text_adapter.scale.fill_(1.0) # Reset về 1.0
-
+            for p in new_text_adapter.parameters():
+                p.requires_grad = True
             self.text_injection.append(new_text_adapter.to(self.device).to(dtype=self.dtype))
         else:
-            # --- SỬ DỤNG LẠI ENGINE_Adapter ---
             self.text_injection.append(
                 ENGINE_Adapter(512, 256, dropout=dropout_rate).to(self.device).to(dtype=self.dtype)
             )
+        
     
 
-
-    # ... (Các hàm _flatten, _unflatten giữ nguyên) ...
     def _flatten_adapter_params(self, adapter):
         params = []
         for name, param in adapter.named_parameters():
@@ -342,35 +319,31 @@ class ClassIncrementalCLIP(nn.Module):
                 pointer += num_elements
         return adapter
 
-    # --- HÀM mix_matrix ĐÃ SỬA ---
-    def mix_matrix(self):
-        # 1. Fusion Image Adapter
-        if len(self.image_injection) < 1:
-            return 
-            
-        all_flat_vectors = []
-        for adapter in self.image_injection: 
-            all_flat_vectors.append(self._flatten_adapter_params(adapter))
-            
-        v_uni_img = torch.stack(all_flat_vectors).mean(dim=0)
-
-        # 2. GÁN v^uni CHO Universal Adapter
-        self._unflatten_adapter_params(self.uni_image_adapter, v_uni_img)
-        # --- SỬA LỖI 1: Đã xóa dòng ghi đè adapter mới nhất ---
-        # self._unflatten_adapter_params(self.image_injection[-1], v_uni_img) 
-        self.freeze(self.uni_image_adapter) 
-
-        # 3. Fusion Text Adapter
-        all_flat_vectors = []
-        for adapter in self.text_injection:
-            all_flat_vectors.append(self._flatten_adapter_params(adapter))
+    def mix_matrix(self, task_id, alpha_ema=0.995):
+        if task_id == 0: 
+            return
         
-        v_uni_txt = torch.stack(all_flat_vectors).mean(dim=0)
-        
-        self._unflatten_adapter_params(self.uni_text_adapter, v_uni_txt)
-        # --- SỬA LỖI 1: Đã xóa dòng ghi đè adapter mới nhất ---
-        # self._unflatten_adapter_params(self.text_injection[-1], v_uni_txt) 
-        self.freeze(self.uni_text_adapter)
+        # IMAGE
+        if len(self.image_injection) > 0:
+            online_img = self.image_injection[-1]
+
+            v_on  = self._flatten_adapter_params(online_img).detach()
+            v_off = self._flatten_adapter_params(self.uni_image_adapter).detach()
+
+            v_new_off = alpha_ema * v_off + (1 - alpha_ema) * v_on
+            self._unflatten_adapter_params(self.uni_image_adapter, v_new_off)
+            self.freeze(self.uni_image_adapter)
+
+        # TEXT
+        if len(self.text_injection) > 0:
+            online_txt = self.text_injection[-1]
+
+            v_on  = self._flatten_adapter_params(online_txt).detach()
+            v_off = self._flatten_adapter_params(self.uni_text_adapter).detach()
+
+            v_new_off = alpha_ema * v_off + (1 - alpha_ema) * v_on
+            self._unflatten_adapter_params(self.uni_text_adapter, v_new_off)
+            self.freeze(self.uni_text_adapter)
 
 
     # ... (Các hàm apply_image_injection, apply_text_injection giữ nguyên) ...
@@ -387,17 +360,9 @@ class ClassIncrementalCLIP(nn.Module):
             
         features = features.to(dtype=target_dtype)
         
-        uni_output = self.uni_image_adapter(features)
         task_output = self.image_injection[-1](features)
 
-        alpha = self.image_fusion_alpha.to(device)
-        beta = self.image_fusion_beta.to(device)
-        
-        fusion_weights = torch.stack([alpha, beta], dim=0)
-        normalized_weights = F.softmax(fusion_weights, dim=0)
-        alpha_hat, beta_hat = normalized_weights[0], normalized_weights[1]
-
-        outputs = (alpha_hat * uni_output) + (beta_hat * task_output)
+        outputs = task_output
         
         return outputs
 
@@ -414,17 +379,10 @@ class ClassIncrementalCLIP(nn.Module):
             
         features = features.to(dtype=target_dtype)
         
-        uni_output = self.uni_text_adapter(features)
         task_output = self.text_injection[-1](features)
 
-        alpha = self.text_fusion_alpha.to(device)
-        beta = self.text_fusion_beta.to(device)
 
-        fusion_weights = torch.stack([alpha, beta], dim=0)
-        normalized_weights = F.softmax(fusion_weights, dim=0)
-        alpha_hat, beta_hat = normalized_weights[0], normalized_weights[1]
-
-        outputs = (alpha_hat * uni_output) + (beta_hat * task_output)
+        outputs = task_output
                     
         return outputs
     
@@ -434,19 +392,18 @@ class ClassIncrementalCLIP(nn.Module):
     @torch.no_grad()
     def get_class_name_features(self):
         class_name_features = self.encode_text(self.text_tokens)
+        class_name_features = self.apply_text_injection(class_name_features)
         templates_per_class = getattr(self, "templates_per_class", 1)
         if templates_per_class > 1:
             num_classes = len(self.total_class_names)
-            class_name_features = class_name_features.view(
-                num_classes, templates_per_class, -1
-            )
-            class_name_features = class_name_features / class_name_features.norm(
-                dim=-1, keepdim=True
-            )
+            class_name_features = class_name_features.view(num_classes, templates_per_class, -1)
+            class_name_features = class_name_features / class_name_features.norm(dim=-1, keepdim=True)
             class_name_features = class_name_features.mean(dim=1)
+        class_name_features = class_name_features / class_name_features.norm(dim=-1, keepdim=True)
         return class_name_features.type(torch.float32)
 
     def adaptation(self, task_id, threshold=0):
+        self.update_injection_units(task_id)
         self.known_classes = len(self.total_class_names)
         self.total_class_names += get_class_names(self.classes_names, self.class_ids_per_task[task_id])
         self.current_class_names = get_class_names(self.classes_names, self.class_ids_per_task[task_id])
@@ -464,8 +421,8 @@ class ClassIncrementalCLIP(nn.Module):
         self.class_name_features = self.class_name_features / self.class_name_features.norm(dim=-1, p=2, keepdim=True)
         self.queue_empty = True
         self.hard_pairs = None
-        if task_id>0:
-            self.update_injection_units()
+
+        if task_id > 0:
             dist_list = []
             for _, class_name_feature in enumerate(self.class_name_features[:-len(self.class_ids_per_task[task_id])]):
                 diff = torch.cdist(self.class_name_features[-len(self.class_ids_per_task[task_id]):].type(torch.float32), class_name_feature.unsqueeze(0).type(torch.float32)).squeeze()
@@ -478,43 +435,89 @@ class ClassIncrementalCLIP(nn.Module):
             self.hard_pairs = indices
             self.hard_pairs[:,1] = self.hard_pairs[:,1]+self.cfg.initial_increment+(task_id-1) * self.cfg.increment
 
+    
     def forward(self, image, ori_ima_f=False, memory_data=None, not_ini=False, edge_sample=None):
-        
         image = image.type(self.dtype)
 
+        # ----- Base CLIP image encoder -----
         with torch.no_grad():
             clip_features = self.encode_image(image).float()
+
         raw_image_features = clip_features / clip_features.norm(dim=-1, keepdim=True)
         original_image_features = clip_features.clone()
-        image_features = clip_features
 
-        image_features = self.apply_image_injection(image_features)
-        image_features = image_features/image_features.norm(dim=-1, keepdim=True)
-        
-        if memory_data is not None:
-            memory_data = memory_data.type(self.dtype)
-            sg_image_features = self.apply_image_injection(memory_data)
-            sg_image_features = sg_image_features / sg_image_features.norm(dim=-1, keepdim=True)
-            img_feas = torch.cat([image_features, sg_image_features], dim=0)
-        else:
-            img_feas = image_features
+        # TRAIN
+        if self.training:
+            # --- IMAGE: online adapter ---
+            image_features = self.image_injection[-1](clip_features)
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
-        edge_num = 0
-        if edge_sample is not None:
-            edge_sample = edge_sample.type(self.dtype)
-            edge_num = edge_sample.shape[0]
-            edge_sample = self.apply_image_injection(edge_sample)
-            edge_sample = edge_sample / edge_sample.norm(dim=-1, keepdim=True)
-            img_feas = torch.cat([img_feas, edge_sample], dim=0)
+            # ----- MEMORY (replay) -----
+            if memory_data is not None:
+                memory_data = memory_data.type(self.dtype)
+                mem_feat = self.image_injection[-1](memory_data)
+                mem_feat = mem_feat / mem_feat.norm(dim=-1, keepdim=True)
+                img_feas = torch.cat([image_features, mem_feat], dim=0)
+            else:
+                img_feas = image_features
 
-        final_image_feas = img_feas
+            # ----- EDGE SAMPLE -----
+            edge_num = 0
+            edge_sample_features = None
+            if edge_sample is not None:
+                edge_sample = edge_sample.type(self.dtype)
+                edge_num = edge_sample.shape[0]
+                edge_feat = self.image_injection[-1](edge_sample)
+                edge_feat = edge_feat / edge_feat.norm(dim=-1, keepdim=True)
+                img_feas = torch.cat([img_feas, edge_feat], dim=0)
 
-        edge_sample_features = None
-        if edge_sample is not None:
-            edge_sample_features = final_image_feas[-edge_num:]
-            final_image_feas = final_image_feas[:-edge_num]
+            final_image_feas = img_feas
 
-        #---------- text features ---------
+            if edge_sample is not None:
+                edge_sample_features = final_image_feas[-edge_num:]
+                final_image_feas = final_image_feas[:-edge_num]
+
+            # ---------- TEXT FEATURES cho logits (không dùng trong loss, chỉ để log/metric) ----------
+            if hasattr(self, "class_name_features") and self.class_name_features is not None:
+                text_features = self.class_name_features
+            else:
+                with torch.no_grad():
+                    text_features = self.encode_text(self.text_tokens)
+                templates_per_class = getattr(self, "templates_per_class", 1)
+                if templates_per_class > 1:
+                    num_classes = len(self.total_class_names)
+                    text_features = text_features.view(num_classes, templates_per_class, -1)
+                    text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+                    text_features = text_features.mean(dim=1)
+
+            # Ở train, cho đơn giản: dùng text_features hiện tại (thường là offline hoặc fixed)
+            final_text_feas = text_features / text_features.norm(dim=-1, keepdim=True)
+
+            logits_per_image = self.logit_scale.exp() * final_image_feas @ final_text_feas.t().type(final_image_feas.dtype)
+            probs = logits_per_image  # chỉ để metric_logger, không dùng trong clip_loss
+
+            # ----- not_ini: cần old_memory_feature (nên dùng offline PET ở đây) -----
+            if not_ini:
+                with torch.no_grad():
+                    old_memory_feature = self.uni_image_adapter(memory_data.type(self.dtype))
+                    old_memory_feature = old_memory_feature / old_memory_feature.norm(dim=1, keepdim=True)
+                if edge_sample is not None:
+                    return probs, final_image_feas, old_memory_feature, edge_sample_features, img_feas, raw_image_features
+                return probs, final_image_feas, old_memory_feature, final_text_feas, img_feas, raw_image_features
+
+            # ----- ori_ima_f trong train thường không dùng, nhưng giữ cho đủ -----
+            if ori_ima_f:
+                if memory_data is not None:
+                    final_image_feas = final_image_feas[:-memory_data.shape[0]]
+                return probs, original_image_features, final_image_feas, None, None, raw_image_features
+
+            return probs, final_image_feas, None, edge_sample_features, img_feas, raw_image_features
+
+        # =========================================================
+        # 2) EVAL / INFERENCE MODE: LAE ENSEMBLE (online + offline)
+        # =========================================================
+
+        # ----- TEXT FEATURES (chung cho cả expert) -----
         if hasattr(self, "class_name_features") and self.class_name_features is not None:
             text_features = self.class_name_features
         else:
@@ -527,27 +530,47 @@ class ClassIncrementalCLIP(nn.Module):
                 text_features = text_features / text_features.norm(dim=-1, keepdim=True)
                 text_features = text_features.mean(dim=1)
 
-        final_text_feas = self.apply_text_injection(text_features)
-        final_text_feas = final_text_feas / final_text_feas.norm(dim=-1, keepdim=True)
+        final_text_feas = text_features / text_features.norm(dim=-1, keepdim=True)
 
-        #---------- logits ---------
-        logits_per_image = self.logit_scale.exp() * final_image_feas @ final_text_feas.t().type(final_image_feas.dtype)
-        probs = logits_per_image
+        # ----- IMAGE BRANCH -----
+        # Luôn có online adapter (image_injection[-1])
+        img_on = self.image_injection[-1](clip_features)
+        img_on = img_on / img_on.norm(dim=-1, keepdim=True)
 
+        # Trường hợp: TASK 0 → CHƯA CÓ uni_image_adapter
+        use_uni = hasattr(self, "uni_image_adapter") and (self.uni_image_adapter is not None)
 
-        if not_ini:
-            with torch.no_grad():
-                old_memory_feature = self.apply_image_injection(memory_data, is_old=True)
-                old_memory_feature = old_memory_feature / old_memory_feature.norm(dim=1, keepdim=True)
-            if edge_sample is not None:
-                return probs, final_image_feas, old_memory_feature, edge_sample_features, img_feas, raw_image_features
-            return probs, final_image_feas, old_memory_feature, final_text_feas, img_feas, raw_image_features
+        if not use_uni:
+            # ========== TASK 0: ONLINE-ONLY ==========
+            logits_on = self.logit_scale.exp() * img_on @ final_text_feas.t().type(img_on.dtype)
+            probs = torch.nn.functional.softmax(logits_on, dim=-1)
+
+            if ori_ima_f:
+                # ori_ima_feat = CLIP gốc, after_adapt_feature = img_on (adapter online)
+                return probs, original_image_features, img_on, None, None, raw_image_features
+
+            return probs, img_on, None, None, img_on, raw_image_features
+
+        # ========== TASK ≥ 1: LAE ENSEMBLE OFFLINE + ONLINE ==========
+        img_off = self.uni_image_adapter(clip_features)
+        img_off = img_off / img_off.norm(dim=-1, keepdim=True)
+
+        logits_off = self.logit_scale.exp() * img_off @ final_text_feas.t().type(img_off.dtype)
+        logits_on  = self.logit_scale.exp() * img_on  @ final_text_feas.t().type(img_on.dtype)
+
+        probs_off = torch.nn.functional.softmax(logits_off, dim=-1)
+        probs_on  = torch.nn.functional.softmax(logits_on,  dim=-1)
+
+        probs_ens = torch.maximum(probs_off, probs_on)  # Eq.(14) LAE
+
         if ori_ima_f:
-            if memory_data is not None:
-                final_image_feas = final_image_feas[:-memory_data.shape[0]]
-            return probs, original_image_features, final_image_feas, None, None, raw_image_features
-        
-        return probs, final_image_feas, None, edge_sample_features, img_feas, raw_image_features
+            # Dùng offline PET làm "after_adapt_feature" để phân tích prototype
+            return probs_ens, original_image_features, img_off, None, None, raw_image_features
+
+        # Eval bình thường
+        return probs_ens, img_on, None, None, img_on, raw_image_features
+
+
 
     def analyze_mean_cov(self, features, labels):
         label = torch.sort(torch.unique(labels))[0]
@@ -568,84 +591,8 @@ class ClassIncrementalCLIP(nn.Module):
             self.class_edge_distance.append((max_distance.mean() - max_distance.min(), max_distance.max() - max_distance.mean(), max_distance.mean()))
             self.class_mean_list.append(mean)
             self.class_cov_list.append(cov)
-    def _flatten_values(value: Any) -> List[str]:
-        out: List[str] = []
-        def _walk(x: Any):
-            if isinstance(x, str):
-                s = x.strip()
-                if s: out.append(s)
-            elif isinstance(x, list):
-                for y in x: _walk(y)
-            elif isinstance(x, dict):
-                for y in x.values(): _walk(y)
-        _walk(value)
-        seen = set(); res = []
-        for s in out:
-            if s not in seen:
-                seen.add(s); res.append(s)
-        return res
-    def _get_text_des(self,dataname='cifar224'):
-        root_path = Path(__file__).resolve().parent.parent
-        des_path = root_path / "chat" / f"{dataname}_des.json"
-        with open(des_path, 'r') as f:
-            des_dict = json.load(f)
-        self.des_dict = des_dict
-        new_des_dict = {}
-        for key, value in des_dict.items():
-            new_key_value = []
-            for k, v in value.items():
-                new_key_value.extend(v)
-            new_des_dict[key] = new_key_value
-        self.new_des_dict = new_des_dict
-        return new_des_dict
-    def _get_batch_des(self, des_file: Dict[str, List[str]], classnames: Iterable[str]) -> List[str]:
-        out: List[str] = []
-        for cname in classnames:
-            descs = des_file.get(cname, [])
-            if descs: 
-                out.append(f"{cname} with {random.choice(descs).casefold()}")
-            else:   
-                out.append(f"a photo of {cname}")
-        return out
-    def rerank(self, des_dict, outputs, image_features_raw, class_names, device, topk=5):
-        with torch.no_grad():
-            batch_size = image_features_raw.shape[0]
-            topk_predict = outputs.topk(topk, dim=1)[1]
-            topk_labels = [[class_names[int(label)] for label in pred] for pred in topk_predict]
-            logi_total = torch.zeros(batch_size, topk, dtype=image_features_raw.dtype, device=device)
-            for _ in range(3):
-                texts = []
-                for b in range(batch_size):
-                    curr_texts = []
-                    for i, main_label in enumerate(topk_labels[b]):
-                        for j, second_label in enumerate(topk_labels[b]):
-                            if i == j:
-                                continue
-                            main_label_norm = main_label.replace("_", " ")
-                            second_label_norm = second_label.replace("_", " ")
-                            if main_label_norm in des_dict and second_label_norm in des_dict[main_label_norm]:
-                                desc = random.choice(des_dict[main_label_norm][second_label_norm])
-                            elif main_label_norm in des_dict:
-                                desc = random.choice(random.choice(list(des_dict[main_label_norm].values())))
-                            else:
-                                desc = "description"
-                                print(f"[WARNING] Nhãn '{main_label_norm}' không có trong des_dict")  
-                            curr_texts.append(f"{main_label_norm} with {desc.lower()}")
-                    texts.extend(curr_texts)
-                texts_token = self.tokenize(texts).to(device)
-                texts_embed = self.encode_text(texts_token)
-                texts_embed = texts_embed.to(image_features_raw.dtype)
-                texts_embed = texts_embed.reshape(batch_size, topk, topk-1, -1)
-                texts_embed = torch.mean(texts_embed, dim=2)
-                texts_embed = texts_embed / texts_embed.norm(dim=-1, keepdim=True)
-                logits = torch.bmm(image_features_raw.unsqueeze(1), texts_embed.transpose(1,2)).squeeze(1)
-                logi_total += logits
-            logits = logi_total / 3
-            logits = logits.to(outputs.dtype)
-            new_logits = torch.zeros_like(outputs)
-            for i in range(batch_size):
-                new_logits[i, topk_predict[i]] = logits[i]
-            return new_logits
+
+
 
 # ... (Phần DomainIncrementalCLIP, TaskAgnosticCLIP, load_model giữ nguyên) ...
 

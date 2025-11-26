@@ -1,6 +1,5 @@
 ﻿import os
 
-from continual_clip.utils import engine_rerank
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import json
 import pdb
@@ -47,13 +46,11 @@ def run_class_incremental(cfg, device):
     
     # model = load_model(cfg, device)
     model = ClassIncrementalCLIP(cfg, device)
-    model.update_injection_units()
 
     eval_dataset, classes_names = build_cl_scenarios(cfg, is_train=False, base_transforms=model.transforms)
     train_dataset, _ = build_cl_scenarios(cfg, is_train=True, base_transforms=model.transforms)
     model.classes_names = classes_names
     print(model.classes_names)
-    model.get_text_des(dataname='cifar224') 
     acc_list = []
     metric_logger = Logger(list_subsets=["train", "test"])
 
@@ -176,31 +173,12 @@ def run_class_incremental(cfg, device):
                 clip_text_feas = model.apply_text_injection(clip_text_feas)
                 clip_text_feas = clip_text_feas /clip_text_feas.norm(dim=-1, keepdim=True)
 
-                # if model.lambda_txt > 0:
-                #     repeat_ = 1 
-                #     ref_text_loss_list = []
-                #     for _ in range(repeat_):
-                #         ref_texts = model._get_batch_des(model.new_des_dict, labels)
-                #         ref_emb = model.tokenize(ref_texts).to(model.device)
-                #         with torch.no_grad():
-                #             ref_text_features = model.encode_text(ref_emb)
-                #         ref_text_features = ref_text_features.float() 
-                #         ref_text_features = ref_text_features / ref_text_features.norm(dim=-1, keepdim=True)
-                #         ref_text_loss_list.append(contrastive_loss(clip_text_feas @ ref_text_features.T))
-                #     ref_text_loss = sum(ref_text_loss_list) / len(ref_text_loss_list)
-                # else:
-                #     ref_text_loss = 0
-                
                 clip_loss=cliploss(final_image_feas, clip_text_feas, model.logit_scale)
-
-                # RAPF: calculate contrastive loss
-                # loss_ce = F.cross_entropy(outputs, targets.detach())
-                
-                # loss =  loss_ce + loss_hinge  + clip_loss + model.lambda_img * image_aug_loss + model.lambda_txt * ref_text_loss
 
                 loss =  clip_loss +  model.lambda_img * image_aug_loss + loss_hinge
                 loss.backward()
                 optimizer.step()
+                model.mix_matrix(task_id)
                 optimizer.zero_grad()
                 tqdm_loader.set_description(
                     f"Ep {i_epoch + 1}/{cfg.epochs} | clip_loss: {clip_loss.item():.4f} | "
@@ -220,6 +198,7 @@ def run_class_incremental(cfg, device):
         sample_data = []
         sample_target = []
         sample_after_adapt_feature = []
+        model.eval()
         print('analyze')
         for input, target, task_ids in tqdm(sample_loader):
             input, target = input.to(device), target.to(device)
@@ -232,27 +211,14 @@ def run_class_incremental(cfg, device):
         sample_data = torch.cat(sample_data, dim=0)
         sample_after_adapt_feature = torch.cat(sample_after_adapt_feature, dim=0)
         model.analyze_mean_cov(sample_data, sample_target)
-        model.mix_matrix()
         model.eval()
+        model.class_name_features = model.get_class_name_features()
 
 
         eval_loader = DataLoader(eval_dataset[:task_id + 1], batch_size=cfg.batch_size, num_workers=cfg.num_workers)
 
         total_labels = model.total_class_names
         print('total labels:', total_labels)
-        templates = cfg.engine.templates
-        text_features = []
-        with torch.no_grad():
-            for l in total_labels:
-                texts = [t.format(l) for t in templates]
-                texts = model.tokenize(texts).to(device)
-                class_embeddings = model.encode_text(texts)
-                class_embeddings = model.apply_text_injection(class_embeddings)
-                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
-                class_embeddings = class_embeddings.mean(dim=0)
-                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
-                text_features.append(class_embeddings)
-            text_features = torch.stack(text_features, dim=0)
             
         correct, total = 0, 0
         for i, (inputs, targets, task_ids) in enumerate(eval_loader):
