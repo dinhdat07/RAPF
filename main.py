@@ -238,7 +238,6 @@ def run_class_incremental(cfg, device):
         fwt = 100 * metric_logger.forward_transfer
 
         # ----- Train logging -----
-        train_acc = 100 * metric_logger.online_accuracy if hasattr(metric_logger, "online_accuracy") else None
         
         # ----- Append vào danh sách để vẽ acc curve -----
         acc_list.append(test_acc)
@@ -247,8 +246,7 @@ def run_class_incremental(cfg, device):
         with open(cfg.log_path, 'a+') as f:
             f.write(json.dumps({
                 'task': task_id,
-                'train_acc': round(train_acc, 2) if train_acc is not None else None,
-                'test_acc': round(test_acc, 2),
+                'acc': round(test_acc, 2),
                 'avg_acc': round(avg_acc, 2),
                 'forgetting': round(forgetting_val, 6),
                 'acc_per_task': acc_per_task,

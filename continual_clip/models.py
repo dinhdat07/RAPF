@@ -319,7 +319,7 @@ class ClassIncrementalCLIP(nn.Module):
                 pointer += num_elements
         return adapter
 
-    def mix_matrix(self, task_id, alpha_ema=0.995):
+    def mix_matrix(self, task_id, alpha_ema=0.9999):
         if task_id == 0: 
             return
         
