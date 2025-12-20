@@ -34,3 +34,15 @@ beta: 2
 mix_bias: 0.7
 threshold: 0.6
 shrinkage: True
+
+exp_name: "${dataset}_${initial_increment}-${increment}"
+
+offline_merge:
+  enabled: false
+  save_theta_each_task: true
+  theta_dir: "checkpoints/offline_thetas/${exp_name}/"
+  base_task: "first"
+  merge_mode: "magmax"
+  lambda_merge: 0.5
+  gamma: 1.0
+  eval_after_merge_only: true

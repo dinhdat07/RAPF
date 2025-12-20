@@ -87,6 +87,9 @@ class ClassIncrementalCLIP(nn.Module):
         self.class_edge_distance = []
         self.mix_b = cfg.mix_bias
 
+        # offline merge stats
+        self.last_task_difficulty = 0.0
+        self.last_num_hard_pairs = 0
 
 
     def encode_text(self, text, prompt=False):
@@ -165,6 +168,8 @@ class ClassIncrementalCLIP(nn.Module):
         self.class_name_features = self.class_name_features / self.class_name_features.norm(dim=-1, p=2, keepdim=True)
         self.queue_empty = True
         self.hard_pairs = None
+        self.last_task_difficulty = 0.0
+        self.last_num_hard_pairs = 0
         if task_id>0:
             self.old_adapter = copy.deepcopy(self.adapter)
             dist_list = []
@@ -175,6 +180,10 @@ class ClassIncrementalCLIP(nn.Module):
             self.class_diff = dist_list
             mask = self.class_diff < threshold
             indices = torch.nonzero(mask)
+            if indices.shape[0] > 0:
+                hard_pair_distances = self.class_diff[mask]
+                self.last_task_difficulty = float(torch.exp(-hard_pair_distances).mean().item())
+                self.last_num_hard_pairs = int(indices.shape[0])
             self.hard_new_class = torch.unique(indices[:,1]) + self.cfg.initial_increment+(task_id-1) * self.cfg.increment
             num_hard_class = self.hard_new_class.shape[0]
             self.hard_pairs = indices
