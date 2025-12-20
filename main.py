@@ -17,6 +17,15 @@ from tqdm import tqdm
 from continual_clip import utils
 from continual_clip.models import load_model, sample
 from continual_clip.datasets import build_cl_scenarios
+from continual_clip.fusion_strategies import apply_fusion_strategy, adapter_state_dict_cpu
+from continual_clip.offline_merge import (
+    apply_merge,
+    compute_task_vectors,
+    load_thetas,
+    merge_la_magmax,
+    merge_magmax,
+    select_base_index,
+)
 import numpy as np
 
 def seed_everything(seed=0):
@@ -41,11 +50,28 @@ def run_class_incremental(cfg, device):
         cfg, is_train=True, transforms=model.transforms
     )
     model.classes_names = classes_names
+    fusion_cfg = getattr(cfg, "fusion", None)
+    offline_cfg = getattr(cfg, "offline_merge", None)
+    offline_enabled = offline_cfg is not None and offline_cfg.enabled
+    evaluate_per_task = True
+    if offline_enabled and getattr(offline_cfg, "eval_after_merge_only", False):
+        evaluate_per_task = False
+    theta_dir = None
+    in_memory_thetas = []
+    task_difficulties = []
+    task_hard_pairs = []
+    if offline_enabled:
+        theta_dir = os.path.join(cfg.workdir, offline_cfg.theta_dir)
+        os.makedirs(theta_dir, exist_ok=True)
     acc_list = []
-    metric_logger = Logger(list_subsets=["test"])
+    metric_logger = Logger(list_subsets=["test"]) if evaluate_per_task else None
     for task_id, _ in enumerate(eval_dataset):
         logging.info(f"Train for task {task_id} has started.")
         model.adaptation(task_id, threshold=cfg.threshold)
+        if offline_enabled:
+            task_difficulties.append(model.last_task_difficulty)
+            task_hard_pairs.append(model.last_num_hard_pairs)
+        adapter_before_cpu = adapter_state_dict_cpu(model.adapter)
         train_loader = DataLoader(train_dataset[task_id], batch_size=cfg.train_batch_size, shuffle=True, num_workers=cfg.num_workers)
         # epoch
         model.train()
@@ -145,34 +171,101 @@ def run_class_incremental(cfg, device):
         sample_data = torch.cat(sample_data, dim=0)
         sample_after_adapt_feature = torch.cat(sample_after_adapt_feature, dim=0)
         model.analyze_mean_cov(sample_data, sample_target)
-        model.mix_matrix()
+        adapter_after_cpu = adapter_state_dict_cpu(model.adapter)
+        if offline_enabled:
+            theta_state = adapter_after_cpu
+            in_memory_thetas.append(theta_state)
+            if offline_cfg.save_theta_each_task:
+                torch.save(theta_state, os.path.join(theta_dir, f"theta_{task_id + 1}.pt"))
+        else:
+            if fusion_cfg is not None and getattr(fusion_cfg, "enabled", False):
+                apply_fusion_strategy(model, cfg, task_id, adapter_before_cpu, adapter_after_cpu)
+                logging.info(f"FUSION mode={fusion_cfg.mode} task={task_id}")
+            else:
+                model.mix_matrix()
+                logging.info(f"FUSION mode=svd task={task_id}")
+        if evaluate_per_task:
+            model.eval()
+            eval_loader = DataLoader(eval_dataset[:task_id + 1], batch_size=cfg.batch_size, num_workers=cfg.num_workers)
+            for inputs, targets, task_ids in eval_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                with torch.no_grad():
+                    outputs, _, __, ___ = model(inputs)
+                    torch.nn.functional.softmax(outputs, dim=-1)
+                metric_logger.add([outputs.cpu().argmax(dim=1), targets.cpu(), task_ids], subset="test")
+
+            acc_list.append(100 * metric_logger.accuracy)
+            with open(cfg.log_path, 'a+') as f:
+                f.write(json.dumps({
+                    'task': task_id,
+                    'acc': round(100 * metric_logger.accuracy, 2),
+                    'avg_acc': round(100 * metric_logger.average_incremental_accuracy, 2),
+                    'forgetting': round(100 * metric_logger.forgetting, 6),
+                    'acc_per_task': [round(100 * acc_t, 2) for acc_t in metric_logger.accuracy_per_task],
+                    'bwt': round(100 * metric_logger.backward_transfer, 2),
+                    'fwt': round(100 * metric_logger.forward_transfer, 2),
+                }) + '\n')
+                metric_logger.end_task()
+
+    if offline_enabled:
+        num_tasks = len(eval_dataset)
+        if len(task_difficulties) < num_tasks:
+            task_difficulties.extend([0.0] * (num_tasks - len(task_difficulties)))
+        if len(task_hard_pairs) < num_tasks:
+            task_hard_pairs.extend([0] * (num_tasks - len(task_hard_pairs)))
+        if offline_cfg.save_theta_each_task:
+            thetas = load_thetas(theta_dir, num_tasks)
+        else:
+            thetas = in_memory_thetas
+        if len(thetas) != num_tasks:
+            raise ValueError(f"Expected {num_tasks} thetas for offline merge, found {len(thetas)}")
+        base_idx = select_base_index(offline_cfg.base_task, num_tasks)
+        logging.info(f"OFFLINE_MERGE base_task={offline_cfg.base_task}, base_idx={base_idx + 1}, lambda_merge={offline_cfg.lambda_merge}, gamma={offline_cfg.gamma}")
+        base_theta = thetas[base_idx]
+        task_vectors = compute_task_vectors(thetas, base_idx)
+        if offline_cfg.merge_mode == "magmax":
+            merged_vector = merge_magmax(task_vectors)
+        elif offline_cfg.merge_mode == "la_magmax":
+            merged_vector = merge_la_magmax(task_vectors, task_difficulties, offline_cfg.gamma)
+        else:
+            raise ValueError(f"Unknown merge_mode {offline_cfg.merge_mode}")
+        theta_merged = apply_merge(base_theta, merged_vector, offline_cfg.lambda_merge)
+        merged_path = os.path.join(theta_dir, "merged_theta.pt")
+        torch.save(theta_merged, merged_path)
+        device_theta = {k: v.to(model.adapter.weight.device).type(model.adapter.weight.dtype) for k, v in theta_merged.items()}
+        model.adapter.load_state_dict(device_theta)
+        difficulty_path = os.path.join(theta_dir, "difficulty.json")
+        with open(difficulty_path, "w") as f:
+            json.dump({'task_difficulties': task_difficulties, 'task_hard_pairs': task_hard_pairs, 'base_idx': base_idx + 1}, f)
         model.eval()
-        eval_loader = DataLoader(eval_dataset[:task_id + 1], batch_size=cfg.batch_size, num_workers=cfg.num_workers)
+        final_metric_logger = Logger(list_subsets=["test"])
+        eval_loader = DataLoader(eval_dataset[:num_tasks], batch_size=cfg.batch_size, num_workers=cfg.num_workers)
         for inputs, targets, task_ids in eval_loader:
             inputs, targets = inputs.to(device), targets.to(device)
             with torch.no_grad():
                 outputs, _, __, ___ = model(inputs)
                 torch.nn.functional.softmax(outputs, dim=-1)
-            metric_logger.add([outputs.cpu().argmax(dim=1), targets.cpu(), task_ids], subset="test")
-
-        acc_list.append(100 * metric_logger.accuracy)
+            final_metric_logger.add([outputs.cpu().argmax(dim=1), targets.cpu(), task_ids], subset="test")
+        final_acc = round(100 * final_metric_logger.accuracy, 2)
+        log_payload = {
+            'offline_merge': True,
+            'base_task': offline_cfg.base_task,
+            'base_idx': base_idx + 1,
+            'merge_mode': offline_cfg.merge_mode,
+            'lambda_merge': offline_cfg.lambda_merge,
+            'gamma': offline_cfg.gamma,
+            'merged_acc': final_acc,
+            'acc_per_task': [round(100 * acc_t, 2) for acc_t in final_metric_logger.accuracy_per_task],
+        }
+        with open(cfg.log_path, 'a+') as f:
+            f.write(json.dumps(log_payload) + '\n')
+        print(f"OFFLINE_MERGE(base={offline_cfg.base_task}, mode={offline_cfg.merge_mode}) merged accuracy: {final_acc}")
+    elif acc_list:
         with open(cfg.log_path, 'a+') as f:
             f.write(json.dumps({
-                'task': task_id,
-                'acc': round(100 * metric_logger.accuracy, 2),
-                'avg_acc': round(100 * metric_logger.average_incremental_accuracy, 2),
-                'forgetting': round(100 * metric_logger.forgetting, 6),
-                'acc_per_task': [round(100 * acc_t, 2) for acc_t in metric_logger.accuracy_per_task],
-                'bwt': round(100 * metric_logger.backward_transfer, 2),
-                'fwt': round(100 * metric_logger.forward_transfer, 2),
+                'last': round(acc_list[-1], 2), 
+                'avg': round(statistics.mean(acc_list), 2)
             }) + '\n')
-            metric_logger.end_task()
-
-    with open(cfg.log_path, 'a+') as f:
-        f.write(json.dumps({
-            'last': round(acc_list[-1], 2), 
-            'avg': round(statistics.mean(acc_list), 2)
-        }) + '\n')
 
 
 
