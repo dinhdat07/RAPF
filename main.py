@@ -2,12 +2,14 @@
 
 from continual_clip.utils import engine_rerank
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+import copy
 import json
 import pdb
 import random
 import hydra
 import logging
 from omegaconf import DictConfig, OmegaConf
+from itertools import chain
 
 import torch
 import statistics
@@ -44,16 +46,41 @@ def run_class_incremental(cfg, device):
             cfg.engine.replay_alpha = float(cfg.engine_replay_alpha)
         if getattr(cfg, 'engine_sample_num', None) is not None:
             cfg.engine.sample_num = int(cfg.engine_sample_num)
+
+    kd_temp = float(getattr(cfg, "kd_temp", 2.0))
+    lambda_kd = float(getattr(cfg, "lambda_kd", 1.0))
+    sigma_proto = float(getattr(cfg, "sigma_proto", 0.01))
+    kd_topk_classes = int(getattr(cfg, "kd_topk_classes", 20))
+    kd_replay_per_class = int(getattr(cfg, "kd_replay_per_class", 2))
+    ce_mask_current_task = bool(getattr(cfg, "ce_mask_current_task", False))
+    debug_router_batches = int(getattr(cfg, "debug_router_batches", 3))
     
     # model = load_model(cfg, device)
     model = ClassIncrementalCLIP(cfg, device)
-    model.update_injection_units()
+    use_moe = bool(getattr(cfg, "use_moe_experts", False))
+    if not use_moe:
+        model.update_injection_units()
+    teacher_model = None
+
+    def sample_proto_batch(target_model, class_indices, per_class):
+        feats = []
+        for cls_idx in class_indices:
+            base_proto = None
+            if cls_idx < len(target_model.prototype):
+                base_proto = target_model.prototype[cls_idx]
+            elif cls_idx < len(target_model.class_mean_list):
+                base_proto = target_model.class_mean_list[cls_idx]
+            if base_proto is None:
+                continue
+            proto = base_proto.to(device).to(target_model.dtype)
+            noise = sigma_proto * torch.randn(per_class, proto.shape[-1], device=device, dtype=proto.dtype)
+            feats.append(proto.unsqueeze(0) + noise)
+        return torch.cat(feats, dim=0) if feats else None
 
     eval_dataset, classes_names = build_cl_scenarios(cfg, is_train=False, base_transforms=model.transforms)
     train_dataset, _ = build_cl_scenarios(cfg, is_train=True, base_transforms=model.transforms)
     model.classes_names = classes_names
     print(model.classes_names)
-    model.get_text_des(dataname='cifar224') 
     acc_list = []
     metric_logger = Logger(list_subsets=["train", "test"])
 
@@ -64,6 +91,8 @@ def run_class_incremental(cfg, device):
         model.adaptation(task_id, threshold=cfg.threshold)
         model.update_stat(known_classes=model.known_classes,total_classes=len(model.total_class_names),train_loader=train_loader,device=device) 
         model.train()
+        if ce_mask_current_task:
+            print(f"[INFO] CE masked: True | task {task_id} classes: {model.class_ids_per_task[task_id]}")
 
         trainable_params = list(model.get_trainable_parameters())
         optimizer = torch.optim.AdamW(trainable_params, lr=cfg.lr, weight_decay=0.05)
@@ -77,6 +106,7 @@ def run_class_incremental(cfg, device):
         for i_epoch in range(epochs):
             loss = torch.tensor(0.0).to(device)
             loss_hinge = torch.tensor(0.0, device=device)
+            entropy_coef = model.router_entropy_coef * max(0.0, 1.0 - i_epoch / max(1, epochs - 1)) if getattr(model, "use_moe_experts", False) else 0.0
             tqdm_loader = tqdm(train_loader)
             if task_id>0:
                 random_class_order_list = list(range(cfg.initial_increment+(task_id-1)*cfg.increment))
@@ -89,6 +119,10 @@ def run_class_incremental(cfg, device):
                 inputs, targets = inputs.to(device), targets.to(device)
                 sg_inputs = None
                 edge_sample = None
+                image_aug_loss = torch.tensor(0.0, device=device)
+                kd_loss = torch.tensor(0.0, device=device)
+                load_balance_loss = torch.tensor(0.0, device=device)
+                entropy_loss = torch.tensor(0.0, device=device)
                 if task_id > 0:
                     sg_inputs = []
                     sg_targets = []
@@ -142,6 +176,32 @@ def run_class_incremental(cfg, device):
 
 
                 outputs, final_image_feas, __, edge_sample_features, pre_image_feas, _raw_image_feas = model(inputs, memory_data=sg_inputs, not_ini=not_ini, edge_sample=edge_sample)
+                router_info = getattr(model, "_latest_router_info", None)
+                if model.use_moe_experts and router_info is not None:
+                    load_balance_loss = router_info.get("load_balance", load_balance_loss)
+                    entropy_loss = router_info.get("entropy", entropy_loss)
+                    if model.debug_router and batch_id < debug_router_batches:
+                        with torch.no_grad():
+                            probs = router_info["probs"].detach()
+                            topk_idx = router_info["topk_idx"].detach()
+                            topk_w = router_info["topk_weights"].detach()
+                            num_experts = int(router_info.get("num_experts", probs.shape[-1]))
+                            top1 = topk_idx[:, 0]
+                            top2 = topk_idx[:, 1] if topk_idx.shape[1] > 1 else None
+                            top1_counts = torch.bincount(top1, minlength=num_experts)
+                            top2_counts = torch.bincount(top2, minlength=num_experts) if top2 is not None else torch.zeros(num_experts, device=device, dtype=torch.long)
+                            mean_pi = probs.mean(dim=0)
+                            mean_w1 = topk_w[:, 0].mean()
+                            mean_w2 = topk_w[:, 1].mean() if topk_w.shape[1] > 1 else torch.tensor(0.0, device=device)
+                            curr_idx = len(model.image_experts)
+                            pct_curr = (top1 == curr_idx).float().mean()
+                            pct_uni = (top1 == 0).float().mean()
+                            print(
+                                f"[DEBUG][router] task{task_id} ep{i_epoch} b{batch_id} "
+                                f"num_exp={num_experts} top1={top1_counts.cpu().tolist()} top2={top2_counts.cpu().tolist()} "
+                                f"mean_pi={mean_pi.cpu().tolist()} w1={mean_w1.item():.3f} w2={mean_w2.item():.3f} "
+                                f"pct_top1_curr={pct_curr.item():.3f} pct_top1_uni={pct_uni.item():.3f}"
+                            )
                 
                 # RAPF: calculate loss hinge
                 if task_id>0 and edge_sample is not None and edge_sample_features is not None:
@@ -175,36 +235,80 @@ def run_class_incremental(cfg, device):
                     clip_text_feas = model.encode_text(clip_tokens)
                 clip_text_feas = model.apply_text_injection(clip_text_feas)
                 clip_text_feas = clip_text_feas /clip_text_feas.norm(dim=-1, keepdim=True)
-
-                # if model.lambda_txt > 0:
-                #     repeat_ = 1 
-                #     ref_text_loss_list = []
-                #     for _ in range(repeat_):
-                #         ref_texts = model._get_batch_des(model.new_des_dict, labels)
-                #         ref_emb = model.tokenize(ref_texts).to(model.device)
-                #         with torch.no_grad():
-                #             ref_text_features = model.encode_text(ref_emb)
-                #         ref_text_features = ref_text_features.float() 
-                #         ref_text_features = ref_text_features / ref_text_features.norm(dim=-1, keepdim=True)
-                #         ref_text_loss_list.append(contrastive_loss(clip_text_feas @ ref_text_features.T))
-                #     ref_text_loss = sum(ref_text_loss_list) / len(ref_text_loss_list)
-                # else:
-                #     ref_text_loss = 0
                 
                 clip_loss=cliploss(final_image_feas, clip_text_feas, model.logit_scale)
+                ce_loss = torch.tensor(0.0, device=device)
+                if ce_mask_current_task:
+                    current_global_ids = list(model.class_ids_per_task[task_id])
+                    seen_global_ids = list(chain.from_iterable(model.class_ids_per_task[:task_id + 1]))
+                    global_to_local = {cid: idx for idx, cid in enumerate(seen_global_ids)}
+                    current_local_ids = [global_to_local[cid] for cid in current_global_ids if cid in global_to_local]
+                    class_mask = torch.zeros(outputs.shape[1], device=device, dtype=torch.bool)
+                    if current_local_ids:
+                        class_mask[torch.tensor(current_local_ids, device=device, dtype=torch.long)] = True
+                    # Torch.isin on CUDA can throw device assert for bad labels; compute on CPU then move back.
+                    in_task_mask = torch.isin(targets.detach().cpu(), torch.tensor(current_global_ids)).to(device)
+                    if in_task_mask.any():
+                        logits_masked = outputs[in_task_mask][:, class_mask].float()
+                        target_cpu = targets[in_task_mask].detach().cpu().tolist()
+                        new_labels_list = [global_to_local[int(t)] for t in target_cpu if int(t) in global_to_local]
+                        new_labels = torch.tensor(new_labels_list, device=device, dtype=torch.long)
+                        ce_loss = F.cross_entropy(logits_masked, new_labels)
+                    if batch_id == 0:
+                        print(f"[DEBUG][CE mask] enabled classes(global)={current_global_ids} local_ids={current_local_ids} samples_in_mask={int(in_task_mask.sum())}/{len(targets)}")
 
-                # RAPF: calculate contrastive loss
-                # loss_ce = F.cross_entropy(outputs, targets.detach())
-                
-                # loss =  loss_ce + loss_hinge  + clip_loss + model.lambda_img * image_aug_loss + model.lambda_txt * ref_text_loss
+                if teacher_model is not None and lambda_kd > 0 and model.known_classes > 0:
+                    old_classes = list(range(model.known_classes))
+                    chosen_classes = random.sample(old_classes, min(len(old_classes), kd_topk_classes)) if len(old_classes) > 0 else []
+                    replay_feats = sample_proto_batch(model, chosen_classes, kd_replay_per_class) if chosen_classes else None
+                    if replay_feats is not None:
+                        teacher_text_feats = teacher_model.class_name_features.to(device)
+                        with torch.no_grad():
+                            teacher_logits = teacher_model.forward_from_features(replay_feats.clone(), text_features=teacher_text_feats)
+                        teacher_logits = teacher_logits.float()
+                        student_logits = model.forward_from_features(replay_feats, text_features=teacher_text_feats)
+                        student_logits = student_logits.float()
+                        k_val = min(kd_topk_classes, teacher_logits.shape[-1])
+                        if k_val < teacher_logits.shape[-1]:
+                            teacher_topk, topk_idx = torch.topk(teacher_logits, k=k_val, dim=-1)
+                            student_topk = student_logits.gather(1, topk_idx)
+                            kd_loss = F.kl_div(
+                                F.log_softmax(student_topk / kd_temp, dim=-1),
+                                F.softmax(teacher_topk / kd_temp, dim=-1),
+                                reduction="batchmean"
+                            ) * (kd_temp ** 2)
+                        else:
+                            kd_loss = F.kl_div(
+                                F.log_softmax(student_logits / kd_temp, dim=-1),
+                                F.softmax(teacher_logits / kd_temp, dim=-1),
+                                reduction="batchmean"
+                            ) * (kd_temp ** 2)
 
-                loss =  clip_loss +  model.lambda_img * image_aug_loss + loss_hinge
+
+                loss =  clip_loss +  model.lambda_img * image_aug_loss + loss_hinge + lambda_kd * kd_loss + model.lambda_lb * load_balance_loss + entropy_coef * entropy_loss + ce_loss
                 loss.backward()
+                if model.use_moe_experts and model.debug_router and batch_id < debug_router_batches and len(getattr(model, "image_experts", [])) > 0:
+                    curr_params = list(model.image_experts[-1].parameters())
+                    curr_grad = sum((p.grad.abs().sum() for p in curr_params if p.grad is not None))
+                    curr_grad_cnt = sum((1 for p in curr_params if p.grad is not None))
+                    prev_grad = torch.tensor(0.0, device=device)
+                    prev_grad_cnt = 0
+                    if len(model.image_experts) > 1:
+                        prev_params = [p for exp in model.image_experts[:-1] for p in exp.parameters()]
+                        prev_grad = sum((p.grad.abs().sum() for p in prev_params if p.grad is not None))
+                        prev_grad_cnt = sum((1 for p in prev_params if p.grad is not None))
+                    router_params = list(model.router.parameters())
+                    router_grad = sum((p.grad.abs().sum() for p in router_params if p.grad is not None))
+                    router_grad_cnt = sum((1 for p in router_params if p.grad is not None))
+                    uni_params = list(model.uni_image_adapter.parameters())
+                    uni_grad = sum((p.grad.abs().sum() for p in uni_params if p.grad is not None))
+                    uni_grad_cnt = sum((1 for p in uni_params if p.grad is not None))
+                    print(f"[DEBUG][router] grad current={float(curr_grad)} (cnt={curr_grad_cnt}) prev={float(prev_grad)} (cnt={prev_grad_cnt}) router={float(router_grad)} (cnt={router_grad_cnt}) uni={float(uni_grad)} (cnt={uni_grad_cnt})")
                 optimizer.step()
                 optimizer.zero_grad()
                 tqdm_loader.set_description(
                     f"Ep {i_epoch + 1}/{cfg.epochs} | clip_loss: {clip_loss.item():.4f} | "
-                    f"Lh: {loss_hinge.item():.4f} | lr: {scheduler.get_last_lr()[0]:.4f}"
+                    f"Lh: {loss_hinge.item():.4f} | kd: {kd_loss.item():.4f} | lb: {load_balance_loss.item():.4f} | ce_m:{ce_loss.item():.4f} | lr: {scheduler.get_last_lr()[0]:.4f}"
                 )
             
             scheduler.step()
@@ -290,6 +394,10 @@ def run_class_incremental(cfg, device):
                 'fwt': round(fwt, 2),
             }) + '\n')
             metric_logger.end_task()
+        teacher_model = copy.deepcopy(model).to(device)
+        teacher_model.eval()
+        for p in teacher_model.parameters():
+            p.requires_grad = False
 
     with open(cfg.log_path, 'a+') as f:
         f.write(json.dumps({
@@ -319,5 +427,3 @@ def continual_clip(cfg: DictConfig) -> None:
 
 if __name__ == "__main__":
     continual_clip()
-
-

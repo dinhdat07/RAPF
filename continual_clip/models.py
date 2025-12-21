@@ -12,6 +12,7 @@ import clip
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor
 
 from .utils import get_class_ids_per_task, get_class_names
 
@@ -90,6 +91,40 @@ class ENGINE_Adapter(nn.Module):
         return residual + x
 
 
+class TopKRouter(nn.Module):
+    """Lightweight router with expandable output head for MoE gating."""
+
+    def __init__(self, dim: int, hidden: int, num_experts: int, topk: int = 2):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.fc1 = nn.Linear(dim, hidden)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden, num_experts)
+        self.topk = topk
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.norm(x)
+        x = self.fc1(x)
+        x = self.act(x)
+        return self.fc2(x)
+
+    def expand_output(self, new_num_experts: int):
+        """Safely expand the final projection when adding experts."""
+        if new_num_experts <= self.fc2.out_features:
+            return
+        old_out = self.fc2
+        new_out = nn.Linear(
+            old_out.in_features,
+            new_num_experts,
+            device=old_out.weight.device,
+            dtype=old_out.weight.dtype,
+        )
+        with torch.no_grad():
+            new_out.weight[: old_out.out_features] = old_out.weight
+            new_out.bias[: old_out.out_features] = old_out.bias
+        self.fc2 = new_out
+
+
 # ... (Các hàm shrink_cov và sample giữ nguyên) ...
 def shrink_cov(cov):
     diag_mean = torch.mean(torch.diagonal(cov))
@@ -142,13 +177,23 @@ class ClassIncrementalCLIP(nn.Module):
         self.dtype = torch.float16 if cfg.fp16 else torch.float32
         self.clip_type = model.dtype
         self.tokenize = clip.tokenize
+        self.use_moe_experts = bool(getattr(cfg, "use_moe_experts", False))
+        self.router_topk = int(getattr(cfg, "router_topk", 2))
+        self.router_hidden = int(getattr(cfg, "router_hidden", 256))
+        self.lambda_lb = float(getattr(cfg, "lambda_lb", 0.01))
+        self.router_entropy_coef = float(getattr(cfg, "router_entropy_coef", 0.0))
+        self.freeze_universal = bool(getattr(cfg, "freeze_universal_expert", True))
+        self.debug_router = bool(getattr(cfg, "debug_router", False))
+        self.debug_router_batches = int(getattr(cfg, "debug_router_batches", 3))
+        self.moe_text = bool(getattr(cfg, "moe_text", False))
 
         # --- SỬ DỤNG LẠI ENGINE_Adapter (đã cải tiến) ---
         dropout_rate = float(getattr(cfg, 'dropout', 0.1))
         self.uni_image_adapter = ENGINE_Adapter(512, 256, dropout=dropout_rate).to(self.device).to(dtype=self.dtype)
         self.uni_text_adapter = ENGINE_Adapter(512, 256, dropout=dropout_rate).to(self.device).to(dtype=self.dtype)
-        self.freeze(self.uni_image_adapter)
-        self.freeze(self.uni_text_adapter)
+        if not self.use_moe_experts or self.freeze_universal:
+            self.freeze(self.uni_image_adapter)
+            self.freeze(self.uni_text_adapter)
 
         self.image_fusion_alpha = nn.Parameter(torch.ones(1)) 
         self.image_fusion_beta = nn.Parameter(torch.ones(1)) 
@@ -162,10 +207,16 @@ class ClassIncrementalCLIP(nn.Module):
         self.lambda_txt = float(getattr(self.engine_cfg, 'lambda_txt', 0.0)) if self.engine_cfg else 0.0
         self.replay_alpha = float(getattr(self.engine_cfg, 'replay_alpha', 0.0)) if self.engine_cfg else 0.0
         self.replay_sample_num = int(getattr(self.engine_cfg, 'sample_num', 0)) if self.engine_cfg else 0
+        # Old fusion path state (kept for backward-compat if MoE is disabled)
         self.image_injection = nn.ModuleList()
         self.prev_image_injection = None
         self.text_injection = nn.ModuleList()
         self.prev_text_injection = None
+        # MoE expert containers
+        self.image_experts = nn.ModuleList()
+        self.text_experts = nn.ModuleList()
+        self.router = TopKRouter(512, self.router_hidden, num_experts=1, topk=self.router_topk).to(self.device) if self.use_moe_experts else None
+        self._latest_router_info: Optional[Dict[str, Tensor]] = None
         self.new_des_dict = {}
         self.prototype: List[torch.Tensor] = []
         self.class_mean_list = []
@@ -242,6 +293,18 @@ class ClassIncrementalCLIP(nn.Module):
     
     # ... (Hàm get_trainable_parameters giữ nguyên) ...
     def get_trainable_parameters(self):
+        if self.use_moe_experts:
+            params = []
+            if self.router is not None:
+                params.append(self.router.parameters())
+            if len(self.image_experts) > 0:
+                params.append([p for p in self.image_experts[-1].parameters() if p.requires_grad])
+            if len(self.text_experts) > 0:
+                params.append([p for p in self.text_experts[-1].parameters() if p.requires_grad])
+            if not self.freeze_universal:
+                params.append([p for p in self.uni_image_adapter.parameters() if p.requires_grad])
+                params.append([p for p in self.uni_text_adapter.parameters() if p.requires_grad])
+            return chain.from_iterable(params)
         params = []
         if self.image_injection and len(self.image_injection) > 0:
             params.append(self.image_injection[-1].parameters())
@@ -272,6 +335,9 @@ class ClassIncrementalCLIP(nn.Module):
 
     # --- HÀM update_injection_units ĐÃ SỬA ---
     def update_injection_units(self, noise_std: float = 0.01):
+        if self.use_moe_experts:
+            # MoE branch manages experts via add_new_task_expert.
+            return
         
         for inj in self.image_injection: 
             self.freeze(inj)
@@ -320,6 +386,48 @@ class ClassIncrementalCLIP(nn.Module):
             self.text_injection.append(
                 ENGINE_Adapter(512, 256, dropout=dropout_rate).to(self.device).to(dtype=self.dtype)
             )
+
+    # --- MoE expert management ---
+    def _init_expert_from(self, src: nn.Module, noise_std: float) -> nn.Module:
+        new_module = copy.deepcopy(src)
+        for param in new_module.parameters():
+            if noise_std > 0:
+                param.data += noise_std * torch.randn_like(param.data)
+            param.requires_grad = True
+        return new_module.to(self.device).to(dtype=self.dtype)
+
+    def freeze_old_experts(self, include_universal: bool = True):
+        if not self.use_moe_experts:
+            return
+        if include_universal or self.freeze_universal:
+            self.freeze(self.uni_image_adapter)
+            self.freeze(self.uni_text_adapter)
+        for exp in self.image_experts:
+            self.freeze(exp)
+        for exp in self.text_experts:
+            self.freeze(exp)
+
+    def add_new_task_expert(self, init_from: str = "universal", noise_std: float = 0.01):
+        """Add a new expert for the current task and expand router head."""
+        if not self.use_moe_experts:
+            return self.update_injection_units(noise_std=noise_std)
+
+        # Freeze older experts; router remains trainable.
+        self.freeze_old_experts(include_universal=self.freeze_universal)
+
+        base_img = self.uni_image_adapter if (init_from == "universal" or len(self.image_experts) == 0) else self.image_experts[-1]
+        base_txt = self.uni_text_adapter if (init_from == "universal" or len(self.text_experts) == 0) else self.text_experts[-1]
+        new_img = self._init_expert_from(base_img, noise_std=noise_std)
+        self.image_experts.append(new_img)
+        if self.moe_text:
+            new_txt = self._init_expert_from(base_txt, noise_std=noise_std)
+            self.text_experts.append(new_txt)
+
+        # Ensure router output dimension matches expert count (U + task experts).
+        if self.router is None:
+            self.router = TopKRouter(512, self.router_hidden, num_experts=1, topk=self.router_topk).to(self.device)
+        self.router.expand_output(1 + len(self.image_experts))
+        self._latest_router_info = None
     
 
 
@@ -344,6 +452,9 @@ class ClassIncrementalCLIP(nn.Module):
 
     # --- HÀM mix_matrix ĐÃ SỬA ---
     def mix_matrix(self):
+        if self.use_moe_experts:
+            # MoE path does not use universal mean fusion.
+            return 
         # 1. Fusion Image Adapter
         if len(self.image_injection) < 1:
             return 
@@ -374,9 +485,45 @@ class ClassIncrementalCLIP(nn.Module):
 
 
     # ... (Các hàm apply_image_injection, apply_text_injection giữ nguyên) ...
-    def apply_image_injection(self, features: torch.Tensor, is_old=False) -> torch.Tensor:
+    def _apply_image_moe(self, features: torch.Tensor):
+        if self.router is None:
+            self.router = TopKRouter(512, self.router_hidden, num_experts=1, topk=self.router_topk).to(self.device)
+        router_logits = self.router(features.float())
+        router_probs = torch.softmax(router_logits, dim=-1)
+        k = min(self.router_topk, router_probs.shape[-1])
+        topk_vals, topk_idx = torch.topk(router_probs, k=k, dim=-1)
+        topk_weights = topk_vals / topk_vals.sum(dim=-1, keepdim=True)
+
+        experts = [self.uni_image_adapter] + list(self.image_experts)
+        target_dtype = next(self.uni_image_adapter.parameters()).dtype
+        expert_outs = torch.stack([exp(features.to(dtype=target_dtype)) for exp in experts], dim=1)
+        selected = expert_outs.gather(1, topk_idx.unsqueeze(-1).expand(-1, -1, expert_outs.shape[-1]))
+        mixed = (topk_weights.unsqueeze(-1) * selected).sum(dim=1)
+
+        prob_mean = router_probs.mean(dim=0)
+        load_balance = ((prob_mean - 1.0 / router_probs.shape[-1]) ** 2).sum()
+        entropy = -(router_probs * router_probs.clamp_min(1e-8).log()).sum(dim=-1).mean()
+        router_info = {
+            "probs": router_probs,
+            "topk_idx": topk_idx,
+            "topk_weights": topk_weights,
+            "load_balance": load_balance,
+            "entropy": entropy,
+            "num_experts": router_probs.shape[-1],
+        }
+        self._latest_router_info = router_info
+        return mixed, router_info
+
+    def apply_image_injection(self, features: torch.Tensor, is_old=False, return_router_info: bool = False):
+        if self.use_moe_experts:
+            mixed, router_info = self._apply_image_moe(features)
+            if return_router_info:
+                return mixed, router_info
+            return mixed
+
+        self._latest_router_info = None
         if len(self.image_injection) == 0:
-            return features
+            return (features, None) if return_router_info else features
 
         device = features.device 
         
@@ -398,10 +545,53 @@ class ClassIncrementalCLIP(nn.Module):
         alpha_hat, beta_hat = normalized_weights[0], normalized_weights[1]
 
         outputs = (alpha_hat * uni_output) + (beta_hat * task_output)
-        
+        if return_router_info:
+            return outputs, None
         return outputs
 
-    def apply_text_injection(self, features: torch.Tensor) -> torch.Tensor:
+    def apply_text_injection(self, features: torch.Tensor, router_info: Optional[Dict[str, Tensor]] = None, batch_size: Optional[int] = None) -> torch.Tensor:
+        if self.use_moe_experts:
+            if not self.moe_text:
+                # Stable text path: only universal text adapter (no routing) for class-conditioned text features.
+                target_dtype = next(self.uni_text_adapter.parameters()).dtype
+                return self.uni_text_adapter(features.to(dtype=target_dtype))
+            # Experimental MoE-on-text (may be unstable).
+            text_experts = [self.uni_text_adapter] + list(self.text_experts)
+            target_dtype = next(self.uni_text_adapter.parameters()).dtype
+            router_info = router_info or self._latest_router_info
+            # Evaluate all experts once.
+            expert_outs = torch.stack([exp(features.to(dtype=target_dtype)) for exp in text_experts], dim=0)
+            if router_info is None or "topk_idx" not in router_info:
+                # Fallback: uniform mix when router info is unavailable (e.g., offline text preprocessing).
+                return expert_outs.mean(dim=0)
+
+            topk_idx = router_info["topk_idx"]
+            topk_weights = router_info["topk_weights"]
+            B_total = topk_idx.shape[0]
+            B = batch_size if batch_size is not None else min(B_total, features.shape[0])
+            topk_idx = topk_idx[:B]
+            topk_weights = topk_weights[:B]
+            if features.dim() == 2 and features.shape[0] == B:
+                # Per-sample text features (e.g., text tokens for each image in batch)
+                expert_outs = expert_outs.permute(1, 0, 2)  # [B, E, D]
+                selected = torch.gather(expert_outs, 1, topk_idx.unsqueeze(-1).expand(-1, -1, expert_outs.shape[-1]))
+                weighted = (topk_weights.unsqueeze(-1) * selected).sum(dim=1)
+                return weighted
+            # Allow broadcasting when features already include batch dimension.
+            if features.dim() == 3 and features.shape[0] == B:
+                # Assume shape [B, C, D]; apply per-sample routing.
+                expanded = expert_outs.unsqueeze(0).expand(B, -1, -1, -1)
+                gather_idx = topk_idx.unsqueeze(-1).unsqueeze(-1).expand(B, topk_idx.shape[1], features.shape[1], features.shape[2])
+                selected = torch.gather(expanded, 1, gather_idx)
+                weighted = (topk_weights.unsqueeze(-1).unsqueeze(-1) * selected).sum(dim=1)
+                return weighted
+
+            expanded = expert_outs.unsqueeze(0).expand(B, -1, expert_outs.shape[1], expert_outs.shape[2])
+            gather_idx = topk_idx.unsqueeze(-1).unsqueeze(-1).expand(B, topk_idx.shape[1], expert_outs.shape[1], expert_outs.shape[2])
+            selected = torch.gather(expanded, 1, gather_idx)
+            weighted = (topk_weights.unsqueeze(-1).unsqueeze(-1) * selected).sum(dim=1)
+            return weighted
+
         if len(self.text_injection) == 0:
             return features
                     
@@ -464,8 +654,12 @@ class ClassIncrementalCLIP(nn.Module):
         self.class_name_features = self.class_name_features / self.class_name_features.norm(dim=-1, p=2, keepdim=True)
         self.queue_empty = True
         self.hard_pairs = None
-        if task_id>0:
+        init_from = "prev" if task_id > 0 else "universal"
+        if self.use_moe_experts:
+            self.add_new_task_expert(init_from=init_from, noise_std=self.sample_noise)
+        elif task_id>0:
             self.update_injection_units()
+        if task_id>0:
             dist_list = []
             for _, class_name_feature in enumerate(self.class_name_features[:-len(self.class_ids_per_task[task_id])]):
                 diff = torch.cdist(self.class_name_features[-len(self.class_ids_per_task[task_id]):].type(torch.float32), class_name_feature.unsqueeze(0).type(torch.float32)).squeeze()
@@ -479,38 +673,55 @@ class ClassIncrementalCLIP(nn.Module):
             self.hard_pairs[:,1] = self.hard_pairs[:,1]+self.cfg.initial_increment+(task_id-1) * self.cfg.increment
 
     def forward(self, image, ori_ima_f=False, memory_data=None, not_ini=False, edge_sample=None):
-        
         image = image.type(self.dtype)
 
         with torch.no_grad():
             clip_features = self.encode_image(image).float()
         raw_image_features = clip_features / clip_features.norm(dim=-1, keepdim=True)
         original_image_features = clip_features.clone()
-        image_features = clip_features
+        base_features = clip_features
 
-        image_features = self.apply_image_injection(image_features)
-        image_features = image_features/image_features.norm(dim=-1, keepdim=True)
-        
+        feature_chunks = [base_features]
+        counts = [base_features.shape[0]]
         if memory_data is not None:
             memory_data = memory_data.type(self.dtype)
-            sg_image_features = self.apply_image_injection(memory_data)
-            sg_image_features = sg_image_features / sg_image_features.norm(dim=-1, keepdim=True)
-            img_feas = torch.cat([image_features, sg_image_features], dim=0)
-        else:
-            img_feas = image_features
-
-        edge_num = 0
+            feature_chunks.append(memory_data)
+            counts.append(memory_data.shape[0])
         if edge_sample is not None:
             edge_sample = edge_sample.type(self.dtype)
-            edge_num = edge_sample.shape[0]
-            edge_sample = self.apply_image_injection(edge_sample)
-            edge_sample = edge_sample / edge_sample.norm(dim=-1, keepdim=True)
-            img_feas = torch.cat([img_feas, edge_sample], dim=0)
+            feature_chunks.append(edge_sample)
+            counts.append(edge_sample.shape[0])
 
-        final_image_feas = img_feas
+        combined_features = torch.cat(feature_chunks, dim=0)
+        image_features_all, router_info = self.apply_image_injection(combined_features, return_router_info=True)
+        self._latest_router_info = router_info
 
+        idx = 0
+        image_features = image_features_all[idx:idx + counts[0]]
+        idx += counts[0]
+        sg_image_features = None
+        if memory_data is not None:
+            sg_image_features = image_features_all[idx:idx + counts[1]]
+            idx += counts[1]
         edge_sample_features = None
         if edge_sample is not None:
+            edge_len = counts[2] if memory_data is not None else counts[1]
+            edge_sample_features = image_features_all[idx:idx + edge_len]
+
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        img_feas_parts = [image_features]
+        if sg_image_features is not None:
+            sg_image_features = sg_image_features / sg_image_features.norm(dim=-1, keepdim=True)
+            img_feas_parts.append(sg_image_features)
+        if edge_sample_features is not None:
+            edge_sample_features = edge_sample_features / edge_sample_features.norm(dim=-1, keepdim=True)
+            img_feas_parts.append(edge_sample_features)
+
+        img_feas = torch.cat(img_feas_parts, dim=0)
+        final_image_feas = img_feas
+
+        edge_num = edge_sample_features.shape[0] if edge_sample_features is not None else 0
+        if edge_sample is not None and edge_num > 0:
             edge_sample_features = final_image_feas[-edge_num:]
             final_image_feas = final_image_feas[:-edge_num]
 
@@ -527,18 +738,19 @@ class ClassIncrementalCLIP(nn.Module):
                 text_features = text_features / text_features.norm(dim=-1, keepdim=True)
                 text_features = text_features.mean(dim=1)
 
-        final_text_feas = self.apply_text_injection(text_features)
-        final_text_feas = final_text_feas / final_text_feas.norm(dim=-1, keepdim=True)
-
-        #---------- logits ---------
-        logits_per_image = self.logit_scale.exp() * final_image_feas @ final_text_feas.t().type(final_image_feas.dtype)
+        final_text_feas = self.apply_text_injection(text_features, router_info=router_info if self.moe_text else None, batch_size=final_image_feas.shape[0])
+        if final_text_feas.dim() == 2:
+            final_text_feas = final_text_feas / final_text_feas.norm(dim=-1, keepdim=True)
+            logits_per_image = self.logit_scale.exp() * final_image_feas @ final_text_feas.t().type(final_image_feas.dtype)
+        else:
+            final_text_feas = final_text_feas / final_text_feas.norm(dim=-1, keepdim=True)
+            logits_per_image = self.logit_scale.exp() * torch.einsum('bd,bcd->bc', final_image_feas, final_text_feas.type(final_image_feas.dtype))
         probs = logits_per_image
 
-
+        old_memory_feature = None
+        if not_ini and memory_data is not None:
+            old_memory_feature = sg_image_features
         if not_ini:
-            with torch.no_grad():
-                old_memory_feature = self.apply_image_injection(memory_data, is_old=True)
-                old_memory_feature = old_memory_feature / old_memory_feature.norm(dim=1, keepdim=True)
             if edge_sample is not None:
                 return probs, final_image_feas, old_memory_feature, edge_sample_features, img_feas, raw_image_features
             return probs, final_image_feas, old_memory_feature, final_text_feas, img_feas, raw_image_features
@@ -548,6 +760,25 @@ class ClassIncrementalCLIP(nn.Module):
             return probs, original_image_features, final_image_feas, None, None, raw_image_features
         
         return probs, final_image_feas, None, edge_sample_features, img_feas, raw_image_features
+
+    def forward_from_features(self, image_features: torch.Tensor, text_features: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Forward helper that starts from pre-computed image features (for distillation replay)."""
+        if text_features is None:
+            text_features = self.class_name_features
+        if self.use_moe_experts:
+            image_features, router_info = self.apply_image_injection(image_features, return_router_info=True)
+            self._latest_router_info = router_info
+        else:
+            router_info = None
+            image_features = self.apply_image_injection(image_features)
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        final_text_feas = self.apply_text_injection(text_features, router_info=router_info if self.moe_text else None, batch_size=image_features.shape[0])
+        final_text_feas = final_text_feas / final_text_feas.norm(dim=-1, keepdim=True)
+        if final_text_feas.dim() == 2:
+            logits = self.logit_scale.exp() * image_features @ final_text_feas.t().type(image_features.dtype)
+        else:
+            logits = self.logit_scale.exp() * torch.einsum('bd,bcd->bc', image_features, final_text_feas.type(image_features.dtype))
+        return logits
 
     def analyze_mean_cov(self, features, labels):
         label = torch.sort(torch.unique(labels))[0]
@@ -584,29 +815,7 @@ class ClassIncrementalCLIP(nn.Module):
             if s not in seen:
                 seen.add(s); res.append(s)
         return res
-    def _get_text_des(self,dataname='cifar224'):
-        root_path = Path(__file__).resolve().parent.parent
-        des_path = root_path / "chat" / f"{dataname}_des.json"
-        with open(des_path, 'r') as f:
-            des_dict = json.load(f)
-        self.des_dict = des_dict
-        new_des_dict = {}
-        for key, value in des_dict.items():
-            new_key_value = []
-            for k, v in value.items():
-                new_key_value.extend(v)
-            new_des_dict[key] = new_key_value
-        self.new_des_dict = new_des_dict
-        return new_des_dict
-    def _get_batch_des(self, des_file: Dict[str, List[str]], classnames: Iterable[str]) -> List[str]:
-        out: List[str] = []
-        for cname in classnames:
-            descs = des_file.get(cname, [])
-            if descs: 
-                out.append(f"{cname} with {random.choice(descs).casefold()}")
-            else:   
-                out.append(f"a photo of {cname}")
-        return out
+    
     def rerank(self, des_dict, outputs, image_features_raw, class_names, device, topk=5):
         with torch.no_grad():
             batch_size = image_features_raw.shape[0]

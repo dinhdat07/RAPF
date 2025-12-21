@@ -33,6 +33,25 @@ beta: 0.5
 mix_bias: 0.6
 threshold: 0.55
 shrinkage: false
+
+use_moe_experts: true
+router_hidden: 256
+router_topk: 2
+
+lambda_lb: 0.02
+router_entropy_coef: 0.001
+freeze_universal_expert: false
+debug_router: false
+debug_router_batches: 3
+moe_text: false
+ce_mask_current_task: false
+
+kd_temp: 2.0
+lambda_kd: 1.5
+sigma_proto: 0.02
+kd_topk_classes: 30
+kd_replay_per_class: 8
+
 engine:
   enable_otf: true
   otf_text: true
