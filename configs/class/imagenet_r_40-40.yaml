@@ -17,19 +17,20 @@ log_path: "metrics.json"
 model_name: "ViT-B/16"
 prompt_template: "a good photo of a {}."
 
-batch_size: 128
-initial_increment: 10  
+batch_size: 64
+initial_increment: 40  
 increment: ${initial_increment}
 scenario: "class"
-dataset: "imagenet100"
+dataset: "imagenet_R"
+# add conig
 num_workers: 16
-train_batch_size: 128
+train_batch_size: 64
 epochs: 15
 lr: 0.001
 fp16: false
 seed: 2
 milestones: [4,10]
-beta: 1
-mix_bias: 0.5
-threshold: 0.65
-shrinkage: False
+beta: 0.5
+mix_bias: 0.7
+threshold: 0.6
+shrinkage: True

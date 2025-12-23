@@ -1,7 +1,6 @@
 # Class-Incremental Learning with CLIP: Adaptive Representation Adjustment and Parameter Fusion (ECCV24)
 This is the official code for our paper: <a href='https://arxiv.org/pdf/2407.14143'><img src='https://img.shields.io/badge/Paper-Arxiv-red'></a>
 
-The code is currently being collated, and configs of other datasets along with more readable code will be released at a later time.
 ## Getting Started
 
 ## Environment
@@ -34,12 +33,32 @@ imagenet1k_path
 ├── val
 │   ├── n01440764 
 │   └── ···
+
+imagenet-r_path
+├── train
+│   ├── n01443537 
+│   └── ···
+├── val
+│   ├── n01443537 
+│   └── ···
+
 ```
 
+The command to run the other two datasets is similar, in run_experiment.sh
 
 ### datasets
-Other datasets and configs will be released soon
+Cifar100 will download automatically.
+Imagenet-R is randomly splited. You can also use our splited list in RAPF/imgr_split/imgr_train_test_split.txt.
 
+The format of imgr_train_test_split.txt:
+```
+train
+n02051845/art_0.jpg
+...
+test
+n02051845/tattoo_4.jpg
+...
+```
 
 ## Acknowledgement
 Our method implementation is based on the [Continual-CLIP](https://github.com/vgthengane/Continual-CLIP).
@@ -49,14 +68,13 @@ Our method implementation is based on the [Continual-CLIP](https://github.com/vg
 If you find our repo useful for your research, please consider citing our paper:
 
 ```bibtex
-@misc{huang2024rapf,
-      title={Class-Incremental Learning with CLIP: Adaptive Representation Adjustment and Parameter Fusion}, 
-      author={Linlan Huang and Xusheng Cao and Haori Lu and Xialei Liu},
-      year={2024},
-      eprint={2407.14143},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2407.14143}, 
+@inproceedings{huang2024class,
+  title={Class-incremental learning with clip: Adaptive representation adjustment and parameter fusion},
+  author={Huang, Linlan and Cao, Xusheng and Lu, Haori and Liu, Xialei},
+  booktitle={European Conference on Computer Vision},
+  pages={214--231},
+  year={2024},
+  organization={Springer}
 }
 ```
 
