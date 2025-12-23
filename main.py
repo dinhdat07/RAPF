@@ -53,7 +53,6 @@ def run_class_incremental(cfg, device):
     train_dataset, _ = build_cl_scenarios(cfg, is_train=True, base_transforms=model.transforms)
     model.classes_names = classes_names
     print(model.classes_names)
-    model.get_text_des(dataname='cifar224') 
     acc_list = []
     metric_logger = Logger(list_subsets=["train", "test"])
 
@@ -93,7 +92,8 @@ def run_class_incremental(cfg, device):
                     sg_inputs = []
                     sg_targets = []
                     if cfg.dataset == "cifar100" and cfg.increment == 5:
-                        list_for_one_batch = [random_class_order_list[batch_id*4%len(random_class_order_list)], random_class_order_list[(batch_id*4+1)%len(random_class_order_list)], random_class_order_list[(batch_id*4+2)%len(random_class_order_list)], random_class_order_list[(batch_id*4+3)%len(random_class_order_list)]]
+                        # list_for_one_batch = [random_class_order_list[batch_id*4%len(random_class_order_list)], random_class_order_list[(batch_id*4+1)%len(random_class_order_list)], random_class_order_list[(batch_id*4+2)%len(random_class_order_list)], random_class_order_list[(batch_id*4+3)%len(random_class_order_list)]]
+                        list_for_one_batch = random_class_order_list.copy()
                     elif cfg.dataset == "imagenet_R":
                         list_for_one_batch = [random_class_order_list[batch_id*5%len(random_class_order_list)], random_class_order_list[(batch_id*5+1)%len(random_class_order_list)], random_class_order_list[(batch_id*5+2)%len(random_class_order_list)], random_class_order_list[(batch_id*5+3)%len(random_class_order_list)], random_class_order_list[(batch_id*5+4)%len(random_class_order_list)]]
                     elif cfg.dataset == "cub200":
@@ -278,6 +278,52 @@ def run_class_incremental(cfg, device):
         acc_list.append(test_acc)
 
         # ----- Ghi log -----
+        # Fusion weights logging (raw + softmaxed) for transparency
+        img_alpha_raw = float(model.image_fusion_alpha.detach().cpu().item())
+        img_beta_raw = float(model.image_fusion_beta.detach().cpu().item())
+
+        train_acc_str = f"{train_acc:.2f}" if train_acc is not None else "None"
+        print(
+            f"[Task {task_id}] "
+            f"train_acc={train_acc_str} | "
+            f"test_acc={test_acc:.2f} | avg_acc={avg_acc:.2f} | "
+            f"forgetting={forgetting_val:.6f}"
+        )
+
+        if model.enable_uni_image:
+            img_weights = torch.softmax(torch.stack([model.image_fusion_alpha, model.image_fusion_beta]), dim=0).detach().cpu()
+            img_alpha_w = float(img_weights[0].item())
+            img_beta_w = float(img_weights[1].item())
+            print(
+                f"  [Image Fusion] "
+                f"alpha_raw={img_alpha_raw:.4f}, beta_raw={img_beta_raw:.4f} | "
+                f"alpha_w={img_alpha_w:.4f}, beta_w={img_beta_w:.4f}"
+            )
+        else:
+            img_alpha_w = None
+            img_beta_w = None
+
+        if getattr(model, "enable_text_adapter", True):
+            txt_alpha_raw = float(model.text_fusion_alpha.detach().cpu().item())
+            txt_beta_raw = float(model.text_fusion_beta.detach().cpu().item())
+            if model.enable_uni_text:
+                txt_weights = torch.softmax(torch.stack([model.text_fusion_alpha, model.text_fusion_beta]), dim=0).detach().cpu()
+                txt_alpha_w = float(txt_weights[0].item())
+                txt_beta_w = float(txt_weights[1].item())
+                print(
+                    f"  [Text Fusion] "
+                    f"alpha_raw={txt_alpha_raw:.4f}, beta_raw={txt_beta_raw:.4f} | "
+                    f"alpha_w={txt_alpha_w:.4f}, beta_w={txt_beta_w:.4f}"
+                )
+            else:
+                txt_alpha_w = None
+                txt_beta_w = None
+        else:
+            txt_alpha_raw = None
+            txt_beta_raw = None
+            txt_alpha_w = None
+            txt_beta_w = None
+
         with open(cfg.log_path, 'a+') as f:
             f.write(json.dumps({
                 'task': task_id,
@@ -288,6 +334,14 @@ def run_class_incremental(cfg, device):
                 'acc_per_task': acc_per_task,
                 'bwt': round(bwt, 2),
                 'fwt': round(fwt, 2),
+                'image_alpha_raw': img_alpha_raw,
+                'image_beta_raw': img_beta_raw,
+                'image_alpha_weight': img_alpha_w,
+                'image_beta_weight': img_beta_w,
+                'text_alpha_raw': txt_alpha_raw,
+                'text_beta_raw': txt_beta_raw,
+                'text_alpha_weight': txt_alpha_w,
+                'text_beta_weight': txt_beta_w,
             }) + '\n')
             metric_logger.end_task()
 

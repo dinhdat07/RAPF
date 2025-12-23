@@ -175,6 +175,10 @@ class ClassIncrementalCLIP(nn.Module):
         self.class_edge_distance = []
         self.mix_b = cfg.mix_bias
         self.sample_noise = float(getattr(self.engine_cfg, 'sample_noise', 0.25)) if self.engine_cfg else 0.25
+        # Flags to toggle adapters
+        self.enable_text_adapter = bool(getattr(cfg, "enable_text_adapter", True))
+        self.enable_uni_image = bool(getattr(cfg, "enable_uni_image", True))
+        self.enable_uni_text = bool(getattr(cfg, "enable_uni_text", True))
 
 
     # ... (Hàm update_stat giữ nguyên) ...
@@ -245,10 +249,12 @@ class ClassIncrementalCLIP(nn.Module):
         params = []
         if self.image_injection and len(self.image_injection) > 0:
             params.append(self.image_injection[-1].parameters())
-            params.append([self.image_fusion_alpha, self.image_fusion_beta])
-        if self.text_injection and len(self.text_injection) > 0:
+            if self.enable_uni_image:
+                params.append([self.image_fusion_alpha, self.image_fusion_beta])
+        if self.enable_text_adapter and self.text_injection and len(self.text_injection) > 0:
             params.append(self.text_injection[-1].parameters())
-            params.append([self.text_fusion_alpha, self.text_fusion_beta])
+            if self.enable_uni_text:
+                params.append([self.text_fusion_alpha, self.text_fusion_beta])
         return chain.from_iterable(params)
     
     # ... (Hàm encode_text, encode_image, freeze giữ nguyên) ...
@@ -302,6 +308,8 @@ class ClassIncrementalCLIP(nn.Module):
             )
 
         # --- TEXT ADAPTER ---
+        if not self.enable_text_adapter:
+            return
         if self.text_injection:
             # 1. Deepcopy
             new_text_adapter = copy.deepcopy(self.text_injection[-1])
@@ -347,32 +355,33 @@ class ClassIncrementalCLIP(nn.Module):
         # 1. Fusion Image Adapter
         if len(self.image_injection) < 1:
             return 
-            
-        all_flat_vectors = []
-        for adapter in self.image_injection: 
-            all_flat_vectors.append(self._flatten_adapter_params(adapter))
-            
-        v_uni_img = torch.stack(all_flat_vectors).mean(dim=0)
 
-        # 2. GÁN v^uni CHO Universal Adapter
-        self._unflatten_adapter_params(self.uni_image_adapter, v_uni_img)
-        # --- SỬA LỖI 1: Đã xóa dòng ghi đè adapter mới nhất ---
-        # self._unflatten_adapter_params(self.image_injection[-1], v_uni_img) 
-        self.freeze(self.uni_image_adapter) 
+        if self.enable_uni_image:
+            all_flat_vectors = []
+            for adapter in self.image_injection: 
+                all_flat_vectors.append(self._flatten_adapter_params(adapter))
+                
+            v_uni_img = torch.stack(all_flat_vectors).mean(dim=0)
 
+            # 2. GÁN v^uni CHO Universal Adapter
+            self._unflatten_adapter_params(self.uni_image_adapter, v_uni_img)
+            # --- SỬA LỖI 1: Đã xóa dòng ghi đè adapter mới nhất ---
+            # self._unflatten_adapter_params(self.image_injection[-1], v_uni_img) 
+            self.freeze(self.uni_image_adapter) 
         # 3. Fusion Text Adapter
-        all_flat_vectors = []
-        for adapter in self.text_injection:
-            all_flat_vectors.append(self._flatten_adapter_params(adapter))
-        
-        v_uni_txt = torch.stack(all_flat_vectors).mean(dim=0)
-        
-        self._unflatten_adapter_params(self.uni_text_adapter, v_uni_txt)
-        # --- SỬA LỖI 1: Đã xóa dòng ghi đè adapter mới nhất ---
-        # self._unflatten_adapter_params(self.text_injection[-1], v_uni_txt) 
-        self.freeze(self.uni_text_adapter)
-
-
+        if self.enable_text_adapter and self.enable_uni_text and len(self.text_injection) > 0:
+            all_flat_vectors = []
+            for adapter in self.text_injection:
+                all_flat_vectors.append(self._flatten_adapter_params(adapter))
+            
+            v_uni_txt = torch.stack(all_flat_vectors).mean(dim=0)
+            
+            self._unflatten_adapter_params(self.uni_text_adapter, v_uni_txt)
+            # --- SỬA LỖI 1: Đã xóa dòng ghi đè adapter mới nhất ---
+            # self._unflatten_adapter_params(self.text_injection[-1], v_uni_txt) 
+            self.freeze(self.uni_text_adapter)
+        return
+            
     # ... (Các hàm apply_image_injection, apply_text_injection giữ nguyên) ...
     def apply_image_injection(self, features: torch.Tensor, is_old=False) -> torch.Tensor:
         if len(self.image_injection) == 0:
@@ -387,22 +396,25 @@ class ClassIncrementalCLIP(nn.Module):
             
         features = features.to(dtype=target_dtype)
         
-        uni_output = self.uni_image_adapter(features)
+        if self.enable_uni_image:
+            uni_output = self.uni_image_adapter(features)
         task_output = self.image_injection[-1](features)
 
-        alpha = self.image_fusion_alpha.to(device)
-        beta = self.image_fusion_beta.to(device)
-        
-        fusion_weights = torch.stack([alpha, beta], dim=0)
-        normalized_weights = F.softmax(fusion_weights, dim=0)
-        alpha_hat, beta_hat = normalized_weights[0], normalized_weights[1]
-
-        outputs = (alpha_hat * uni_output) + (beta_hat * task_output)
+        if self.enable_uni_image:
+            alpha = self.image_fusion_alpha.to(device)
+            beta = self.image_fusion_beta.to(device)
+            
+            fusion_weights = torch.stack([alpha, beta], dim=0)
+            normalized_weights = F.softmax(fusion_weights, dim=0)
+            alpha_hat, beta_hat = normalized_weights[0], normalized_weights[1]
+            outputs = (alpha_hat * uni_output) + (beta_hat * task_output)
+        else:
+            outputs = task_output
         
         return outputs
 
     def apply_text_injection(self, features: torch.Tensor) -> torch.Tensor:
-        if len(self.text_injection) == 0:
+        if not self.enable_text_adapter or len(self.text_injection) == 0:
             return features
                     
         device = features.device
@@ -414,17 +426,20 @@ class ClassIncrementalCLIP(nn.Module):
             
         features = features.to(dtype=target_dtype)
         
-        uni_output = self.uni_text_adapter(features)
+        if self.enable_uni_text:
+            uni_output = self.uni_text_adapter(features)
         task_output = self.text_injection[-1](features)
 
-        alpha = self.text_fusion_alpha.to(device)
-        beta = self.text_fusion_beta.to(device)
+        if self.enable_uni_text:
+            alpha = self.text_fusion_alpha.to(device)
+            beta = self.text_fusion_beta.to(device)
 
-        fusion_weights = torch.stack([alpha, beta], dim=0)
-        normalized_weights = F.softmax(fusion_weights, dim=0)
-        alpha_hat, beta_hat = normalized_weights[0], normalized_weights[1]
-
-        outputs = (alpha_hat * uni_output) + (beta_hat * task_output)
+            fusion_weights = torch.stack([alpha, beta], dim=0)
+            normalized_weights = F.softmax(fusion_weights, dim=0)
+            alpha_hat, beta_hat = normalized_weights[0], normalized_weights[1]
+            outputs = (alpha_hat * uni_output) + (beta_hat * task_output)
+        else:
+            outputs = task_output
                     
         return outputs
     
