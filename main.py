@@ -246,14 +246,35 @@ def run_class_incremental(cfg, device):
                     class_mask = torch.zeros(outputs.shape[1], device=device, dtype=torch.bool)
                     if current_local_ids:
                         class_mask[torch.tensor(current_local_ids, device=device, dtype=torch.long)] = True
+                    # Map dataset target (which may be position in class_order) to class_id
+                    def target_to_class_id(tval: int) -> int:
+                        t_int = int(tval)
+                        return int(cfg.class_order[t_int]) if t_int < len(cfg.class_order) else t_int
                     # Torch.isin on CUDA can throw device assert for bad labels; compute on CPU then move back.
-                    in_task_mask = torch.isin(targets.detach().cpu(), torch.tensor(current_global_ids)).to(device)
+                    targets_class_cpu = torch.tensor([target_to_class_id(t) for t in targets.detach().cpu().tolist()], dtype=torch.long)
+                    in_task_mask = torch.isin(targets_class_cpu, torch.tensor(current_global_ids, dtype=torch.long)).to(device)
                     if in_task_mask.any():
-                        logits_masked = outputs[in_task_mask][:, class_mask].float()
+                        logits_masked_full = outputs[in_task_mask][:, class_mask].float()
+                        # Map local ids to contiguous mask column indices
+                        mask_indices = torch.nonzero(class_mask, as_tuple=False).squeeze(1).tolist()
+                        local_to_mask = {int(loc): idx for idx, loc in enumerate(mask_indices)}
                         target_cpu = targets[in_task_mask].detach().cpu().tolist()
-                        new_labels_list = [global_to_local[int(t)] for t in target_cpu if int(t) in global_to_local]
-                        new_labels = torch.tensor(new_labels_list, device=device, dtype=torch.long)
-                        ce_loss = F.cross_entropy(logits_masked, new_labels)
+                        new_labels_list = []
+                        keep_indices = []
+                        for idx_t, t_val in enumerate(target_cpu):
+                            class_id_val = target_to_class_id(t_val)
+                            mapped = local_to_mask.get(global_to_local.get(class_id_val, -1), -1)
+                            if mapped >= 0:
+                                new_labels_list.append(mapped)
+                                keep_indices.append(idx_t)
+                        if len(new_labels_list) != len(target_cpu):
+                            if batch_id == 0:
+                                skipped = len(target_cpu) - len(new_labels_list)
+                                print(f"[WARN][CE mask] found targets without mapping; skipping {skipped} samples")
+                        if new_labels_list:
+                            logits_masked = logits_masked_full[keep_indices]
+                            new_labels = torch.tensor(new_labels_list, device=device, dtype=torch.long)
+                            ce_loss = F.cross_entropy(logits_masked, new_labels)
                     if batch_id == 0:
                         print(f"[DEBUG][CE mask] enabled classes(global)={current_global_ids} local_ids={current_local_ids} samples_in_mask={int(in_task_mask.sum())}/{len(targets)}")
 
