@@ -157,6 +157,7 @@ def run_class_incremental(cfg, device):
                     loss_hinge = torch.tensor(0.0, device=device)
                 
                 # calculate aug-image contrastive loss
+                image_aug_loss = torch.tensor(0.0, device=device)
                 if model.lambda_img > 0:
                     with torch.no_grad():
                         aug = torch.clamp(inputs + torch.randn_like(inputs) * 0.25, 0, 1)
@@ -173,19 +174,23 @@ def run_class_incremental(cfg, device):
                     clip_text_feas = model.encode_text(clip_tokens)
                 clip_text_feas = clip_text_feas /clip_text_feas.norm(dim=-1, keepdim=True)
                 
-                
+
 
                 # calculate contrastive loss
                 clip_loss=cliploss(final_image_feas, clip_text_feas, model.logit_scale)
                 # loss_ce = F.cross_entropy(outputs, targets.detach())
+
+                anchor_loss = torch.tensor(0.0, device=device)
+                if getattr(model, "use_fsa", False) and sg_inputs is not None:
+                    anchor_loss = model.compute_fsa_loss(sg_inputs)
                 
-                loss = clip_loss +  model.lambda_img * image_aug_loss + loss_hinge
+                loss = clip_loss +  model.lambda_img * image_aug_loss + loss_hinge + model.lambda_anchor * anchor_loss
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
                 tqdm_loader.set_description(
                     f"Ep {i_epoch + 1}/{cfg.epochs} | clip_loss: {clip_loss.item():.4f} | "
-                    f"Lh: {loss_hinge.item():.4f} | lr: {scheduler.get_last_lr()[0]:.4f}"
+                    f"Lh: {loss_hinge.item():.4f} | FSA: {anchor_loss.item():.4f} | lr: {scheduler.get_last_lr()[0]:.4f}"
                 )
             
             scheduler.step()

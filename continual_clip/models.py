@@ -160,6 +160,9 @@ class ClassIncrementalCLIP(nn.Module):
         self.image_injection = nn.ModuleList()
         self.prev_image_injection = None
 
+        self.use_fsa = bool(getattr(cfg, "use_fsa", False))
+        self.lambda_anchor = float(getattr(cfg, "lambda_anchor", 0.0))
+
         self.prototype: List[torch.Tensor] = []
         self.class_mean_list = []
         self.class_cov_list = []
@@ -193,6 +196,11 @@ class ClassIncrementalCLIP(nn.Module):
             param.requires_grad = False
 
     def update_injection_units(self, noise_std=0.01):
+        # create snapshot of last adapter for FSA before freezing
+        if self.use_fsa and self.image_injection:
+            last_adapter = self.image_injection[-1]
+            last_adapter.create_snapshot()
+
         for inj in self.image_injection: 
             self.freeze(inj)
 
@@ -207,26 +215,13 @@ class ClassIncrementalCLIP(nn.Module):
             if hasattr(new_image_adapter, 'scale'):
                 with torch.no_grad():
                     new_image_adapter.scale.fill_(1.0) 
+            if hasattr(new_image_adapter, "frozen_snapshot"):
+                new_image_adapter.frozen_snapshot = None
             
             self.image_injection.append(new_image_adapter.to(self.device).to(dtype=self.dtype))
         else:
-            self.image_injection.append(Adapter(512, 256, dropout=dropout_rate).to(self.device).to(dtype=self.dtype))
-
-    def _flatten_adapter_params(self, adapter):
-        params = []
-        for name, param in adapter.named_parameters():
-            if isinstance(param, nn.Parameter):
-                params.append(param.data.flatten())
-        return torch.cat(params)
-
-    def _unflatten_adapter_params(self, adapter, flat_vector):
-        pointer = 0
-        for name, param in adapter.named_parameters():
-            if isinstance(param, nn.Parameter):
-                num_elements = param.numel()
-                param.data.copy_(flat_vector[pointer:pointer + num_elements].view_as(param.data))
-                pointer += num_elements
-        return adapter
+            base_adapter = FSAAdapter(512, 256, dropout=dropout_rate) if self.use_fsa else Adapter(512, 256, dropout=dropout_rate)
+            self.image_injection.append(base_adapter.to(self.device).to(dtype=self.dtype))
 
     def apply_image_injection(self, features):
         if len(self.image_injection) == 0:
@@ -240,6 +235,14 @@ class ClassIncrementalCLIP(nn.Module):
         task_output = self.image_injection[-1](features)
         outputs = task_output
         return outputs
+
+    def compute_fsa_loss(self, replay_features):
+        if not self.use_fsa or replay_features is None or len(self.image_injection) == 0:
+            return torch.tensor(0.0, device=self.device)
+        adapter = self.image_injection[-1]
+        if hasattr(adapter, "get_anchor_loss"):
+            return adapter.get_anchor_loss(replay_features)
+        return torch.tensor(0.0, device=self.device)
     
     @torch.no_grad()
     def get_class_name_features(self):

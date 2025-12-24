@@ -6,6 +6,8 @@ import yaml
 
 from omegaconf import DictConfig, OmegaConf
 from typing import Optional
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 
@@ -42,3 +44,21 @@ def get_workdir(path):
         None
     )
     return str(Path(*split_path[:workdir_idx+1]))
+
+
+
+def flatten_adapter_params(self, adapter):
+    params = []
+    for name, param in adapter.named_parameters():
+        if isinstance(param, nn.Parameter):
+            params.append(param.data.flatten())
+    return torch.cat(params)
+
+def unflatten_adapter_params(self, adapter, flat_vector):
+    pointer = 0
+    for name, param in adapter.named_parameters():
+        if isinstance(param, nn.Parameter):
+            num_elements = param.numel()
+            param.data.copy_(flat_vector[pointer:pointer + num_elements].view_as(param.data))
+            pointer += num_elements
+    return adapter

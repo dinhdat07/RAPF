@@ -1,4 +1,4 @@
-﻿hydra:
+hydra:
   run:
     dir: ./experiments/${scenario}/${dataset}_${initial_increment}-${increment}_without_exp
   job:
@@ -29,7 +29,9 @@ dataset: "cifar100"
 num_workers: 16
 train_batch_size: 50
 epochs: 15
-lr: 0.001
+lr: 
+use_fsa: true
+lambda_anchor: 0.5
 fp16: false
 seed: 2
 milestones: [4,10]
