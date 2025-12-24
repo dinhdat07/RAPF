@@ -30,8 +30,6 @@ def get_dataset_class_names(workdir, dataset_name, long=False):
         lines = f.read().splitlines()
     return [line.split("\t")[-1] for line in lines]
 
-
-
 def save_config(config: DictConfig) -> None:
     OmegaConf.save(config, "config.yaml")
 
@@ -44,46 +42,3 @@ def get_workdir(path):
         None
     )
     return str(Path(*split_path[:workdir_idx+1]))
-
-def get_engine_descriptor_path(workdir: str, dataset_name: str) -> Optional[str]:
-    mapping = {
-        'cifar100': os.path.join('chat', 'cifar224_des.json'),
-        'imagenet_r': os.path.join('chat', 'imagenetr_des.json'),
-        'cub200': os.path.join('chat', 'cub_des.json'),
-    }
-    dataset_key = dataset_name.lower() if dataset_name else ''
-    candidate = mapping.get(dataset_key)
-    if not candidate:
-        return None
-    candidate_path = os.path.normpath(os.path.join(workdir, candidate))
-    return candidate_path if os.path.isfile(candidate_path) else None
-
-def normalize_key(name: str):
-    return name.replace("_", " ").lower()
-
-def engine_rerank(model, outputs, raw_image_feas, device, cfg):
-
-    with torch.no_grad():
-        if hasattr(cfg, "epochs") and epoch == cfg.epochs:
-            # GDA classifier
-            outputs_gda = raw_image_feas @ model.W + model.b
-            outputs_gda = outputs_gda / outputs_gda.norm(dim=-1, keepdim=True)
-
-        # Rerank batch
-        outputs_rerank = model.rerank(
-            des_dict=model.des_dict,
-            outputs=outputs,
-            image_features_raw=raw_image_feas,
-            class_names=model.total_class_names,
-            device=device,
-            topk=cfg.engine.topk
-        )
-
-        # GDA + rerank + original outputs
-        outputs = (
-            outputs_gda * cfg.engine.stat
-            + (cfg.engine.rerank * outputs_rerank
-                + (1 - cfg.engine.rerank) * outputs) * (1 - cfg.engine.stat)
-        )
-
-    return outputs

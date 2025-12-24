@@ -12,11 +12,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def engine_contrastive_loss(similarity: torch.Tensor) -> torch.Tensor:
-    targets = torch.arange(similarity.size(0), device=similarity.device)
-    return F.cross_entropy(similarity, targets) 
-
-
 def contrastive_loss(logits: torch.Tensor) -> torch.Tensor:
     return F.cross_entropy(logits, torch.arange(len(logits), device=logits.device))
 
@@ -57,24 +52,10 @@ class ClipLoss(nn.Module):
         return labels
 
     def get_logits(self, image_features, text_features, logit_scale):
-        if self.world_size > 1:
-            all_image_features, all_text_features = gather_features(
-                image_features, text_features,
-                self.local_loss, self.gather_with_grad, self.rank, self.world_size, self.use_horovod)
-            image_features = image_features.float()
-            text_features = text_features.float()
-
-            if self.local_loss:
-                logits_per_image = logit_scale * image_features @ all_text_features.T
-                logits_per_text = logit_scale * text_features @ all_image_features.T
-            else:
-                logits_per_image = logit_scale * all_image_features @ all_text_features.T
-                logits_per_text = logits_per_image.T
-        else:
-            image_features = image_features.float()
-            text_features = text_features.float()
-            logits_per_image = logit_scale * image_features @ text_features.T
-            logits_per_text = logit_scale * text_features @ image_features.T
+        image_features = image_features.float()
+        text_features = text_features.float()
+        logits_per_image = logit_scale * image_features @ text_features.T
+        logits_per_text = logit_scale * text_features @ image_features.T
         
         return logits_per_image, logits_per_text
 

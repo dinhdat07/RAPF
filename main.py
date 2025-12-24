@@ -18,7 +18,7 @@ from continuum.metrics import Logger
 from tqdm import tqdm
 from continual_clip import utils
 from continual_clip.models import ClassIncrementalCLIP, load_model, sample
-from continual_clip.losses import contrastive_loss, engine_contrastive_loss
+from continual_clip.losses import contrastive_loss
 from continual_clip.datasets import build_cl_scenarios
 import numpy as np
 
@@ -61,7 +61,6 @@ def run_class_incremental(cfg, device):
         train_loader = DataLoader(train_dataset[task_id], batch_size=cfg.train_batch_size, shuffle=True, num_workers=cfg.num_workers)
         
         model.adaptation(task_id, threshold=cfg.threshold)
-        model.update_stat(known_classes=model.known_classes,total_classes=len(model.total_class_names),train_loader=train_loader,device=device) 
         model.train()
 
         trainable_params = list(model.get_trainable_parameters())
@@ -92,8 +91,8 @@ def run_class_incremental(cfg, device):
                     sg_inputs = []
                     sg_targets = []
                     if cfg.dataset == "cifar100" and cfg.increment == 5:
-                        # list_for_one_batch = [random_class_order_list[batch_id*4%len(random_class_order_list)], random_class_order_list[(batch_id*4+1)%len(random_class_order_list)], random_class_order_list[(batch_id*4+2)%len(random_class_order_list)], random_class_order_list[(batch_id*4+3)%len(random_class_order_list)]]
                         list_for_one_batch = random_class_order_list.copy()
+                        # list_for_one_batch = [random_class_order_list[batch_id*4%len(random_class_order_list)], random_class_order_list[(batch_id*4+1)%len(random_class_order_list)], random_class_order_list[(batch_id*4+2)%len(random_class_order_list)], random_class_order_list[(batch_id*4+3)%len(random_class_order_list)]]
                     elif cfg.dataset == "imagenet_R":
                         list_for_one_batch = [random_class_order_list[batch_id*5%len(random_class_order_list)], random_class_order_list[(batch_id*5+1)%len(random_class_order_list)], random_class_order_list[(batch_id*5+2)%len(random_class_order_list)], random_class_order_list[(batch_id*5+3)%len(random_class_order_list)], random_class_order_list[(batch_id*5+4)%len(random_class_order_list)]]
                     elif cfg.dataset == "cub200":
@@ -158,7 +157,7 @@ def run_class_incremental(cfg, device):
                 else:
                     loss_hinge = torch.tensor(0.0, device=device)
                 
-                # ENGINE: calculate aug-image contrastive loss
+                # calculate aug-image contrastive loss
                 if model.lambda_img > 0:
                     with torch.no_grad():
                         aug = torch.clamp(inputs + torch.randn_like(inputs) * 0.25, 0, 1)
@@ -167,38 +166,21 @@ def run_class_incremental(cfg, device):
                     sim_img = final_image_feas[:aug_feas.shape[0]] @ aug_feas.T
                     image_aug_loss = contrastive_loss(sim_img)
 
-                # ENGINE: get text features by targets and calculate text-des loss
+                # get text features by targets and calculate clip loss
                 labels = [model.total_class_names[int(y)] for y in targets.tolist()]
                 texts_clip=[model.prompt_template.format(inst) for inst in labels]
                 with torch.no_grad():  
                     clip_tokens = model.tokenize(texts_clip).to(model.device)
                     clip_text_feas = model.encode_text(clip_tokens)
-                clip_text_feas = model.apply_text_injection(clip_text_feas)
                 clip_text_feas = clip_text_feas /clip_text_feas.norm(dim=-1, keepdim=True)
-
-                # if model.lambda_txt > 0:
-                #     repeat_ = 1 
-                #     ref_text_loss_list = []
-                #     for _ in range(repeat_):
-                #         ref_texts = model._get_batch_des(model.new_des_dict, labels)
-                #         ref_emb = model.tokenize(ref_texts).to(model.device)
-                #         with torch.no_grad():
-                #             ref_text_features = model.encode_text(ref_emb)
-                #         ref_text_features = ref_text_features.float() 
-                #         ref_text_features = ref_text_features / ref_text_features.norm(dim=-1, keepdim=True)
-                #         ref_text_loss_list.append(contrastive_loss(clip_text_feas @ ref_text_features.T))
-                #     ref_text_loss = sum(ref_text_loss_list) / len(ref_text_loss_list)
-                # else:
-                #     ref_text_loss = 0
                 
-                clip_loss=cliploss(final_image_feas, clip_text_feas, model.logit_scale)
-
-                # RAPF: calculate contrastive loss
-                # loss_ce = F.cross_entropy(outputs, targets.detach())
                 
-                # loss =  loss_ce + loss_hinge  + clip_loss + model.lambda_img * image_aug_loss + model.lambda_txt * ref_text_loss
 
-                loss =  clip_loss +  model.lambda_img * image_aug_loss + loss_hinge
+                # calculate contrastive loss
+                # clip_loss=cliploss(final_image_feas, clip_text_feas, model.logit_scale)
+                loss_ce = F.cross_entropy(outputs, targets.detach())
+                
+                loss =  loss_ce +  model.lambda_img * image_aug_loss + loss_hinge
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
@@ -232,7 +214,6 @@ def run_class_incremental(cfg, device):
         sample_data = torch.cat(sample_data, dim=0)
         sample_after_adapt_feature = torch.cat(sample_after_adapt_feature, dim=0)
         model.analyze_mean_cov(sample_data, sample_target)
-        model.mix_matrix()
         model.eval()
 
 
@@ -240,19 +221,6 @@ def run_class_incremental(cfg, device):
 
         total_labels = model.total_class_names
         print('total labels:', total_labels)
-        templates = cfg.engine.templates
-        text_features = []
-        with torch.no_grad():
-            for l in total_labels:
-                texts = [t.format(l) for t in templates]
-                texts = model.tokenize(texts).to(device)
-                class_embeddings = model.encode_text(texts)
-                class_embeddings = model.apply_text_injection(class_embeddings)
-                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
-                class_embeddings = class_embeddings.mean(dim=0)
-                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
-                text_features.append(class_embeddings)
-            text_features = torch.stack(text_features, dim=0)
             
         correct, total = 0, 0
         for i, (inputs, targets, task_ids) in enumerate(eval_loader):
@@ -263,7 +231,7 @@ def run_class_incremental(cfg, device):
             metric_logger.add([outputs.cpu().argmax(dim=1), targets.cpu(), task_ids], subset="test")
 
 
-        # ----- Test logging -----
+        # test logging
         test_acc = 100 * metric_logger.accuracy
         avg_acc = 100 * metric_logger.average_incremental_accuracy
         forgetting_val = 100 * metric_logger.forgetting
@@ -271,17 +239,9 @@ def run_class_incremental(cfg, device):
         bwt = 100 * metric_logger.backward_transfer
         fwt = 100 * metric_logger.forward_transfer
 
-        # ----- Train logging -----
+        # train logging
         train_acc = 100 * metric_logger.online_accuracy if hasattr(metric_logger, "online_accuracy") else None
-        
-        # ----- Append vào danh sách để vẽ acc curve -----
         acc_list.append(test_acc)
-
-        # ----- Ghi log -----
-        # Fusion weights logging (raw + softmaxed) for transparency
-        img_alpha_raw = float(model.image_fusion_alpha.detach().cpu().item())
-        img_beta_raw = float(model.image_fusion_beta.detach().cpu().item())
-
         train_acc_str = f"{train_acc:.2f}" if train_acc is not None else "None"
         print(
             f"[Task {task_id}] "
@@ -289,40 +249,6 @@ def run_class_incremental(cfg, device):
             f"test_acc={test_acc:.2f} | avg_acc={avg_acc:.2f} | "
             f"forgetting={forgetting_val:.6f}"
         )
-
-        if model.enable_uni_image:
-            img_weights = torch.softmax(torch.stack([model.image_fusion_alpha, model.image_fusion_beta]), dim=0).detach().cpu()
-            img_alpha_w = float(img_weights[0].item())
-            img_beta_w = float(img_weights[1].item())
-            print(
-                f"  [Image Fusion] "
-                f"alpha_raw={img_alpha_raw:.4f}, beta_raw={img_beta_raw:.4f} | "
-                f"alpha_w={img_alpha_w:.4f}, beta_w={img_beta_w:.4f}"
-            )
-        else:
-            img_alpha_w = None
-            img_beta_w = None
-
-        if getattr(model, "enable_text_adapter", True):
-            txt_alpha_raw = float(model.text_fusion_alpha.detach().cpu().item())
-            txt_beta_raw = float(model.text_fusion_beta.detach().cpu().item())
-            if model.enable_uni_text:
-                txt_weights = torch.softmax(torch.stack([model.text_fusion_alpha, model.text_fusion_beta]), dim=0).detach().cpu()
-                txt_alpha_w = float(txt_weights[0].item())
-                txt_beta_w = float(txt_weights[1].item())
-                print(
-                    f"  [Text Fusion] "
-                    f"alpha_raw={txt_alpha_raw:.4f}, beta_raw={txt_beta_raw:.4f} | "
-                    f"alpha_w={txt_alpha_w:.4f}, beta_w={txt_beta_w:.4f}"
-                )
-            else:
-                txt_alpha_w = None
-                txt_beta_w = None
-        else:
-            txt_alpha_raw = None
-            txt_beta_raw = None
-            txt_alpha_w = None
-            txt_beta_w = None
 
         with open(cfg.log_path, 'a+') as f:
             f.write(json.dumps({
@@ -333,15 +259,7 @@ def run_class_incremental(cfg, device):
                 'forgetting': round(forgetting_val, 6),
                 'acc_per_task': acc_per_task,
                 'bwt': round(bwt, 2),
-                'fwt': round(fwt, 2),
-                'image_alpha_raw': img_alpha_raw,
-                'image_beta_raw': img_beta_raw,
-                'image_alpha_weight': img_alpha_w,
-                'image_beta_weight': img_beta_w,
-                'text_alpha_raw': txt_alpha_raw,
-                'text_beta_raw': txt_beta_raw,
-                'text_alpha_weight': txt_alpha_w,
-                'text_beta_weight': txt_beta_w,
+                'fwt': round(fwt, 2)
             }) + '\n')
             metric_logger.end_task()
 
@@ -350,9 +268,6 @@ def run_class_incremental(cfg, device):
             'last': round(acc_list[-1], 2), 
             'avg': round(statistics.mean(acc_list), 2)
         }) + '\n')
-
-
-
 
 
 @hydra.main(config_path=None, config_name=None, version_base="1.1") 
@@ -370,7 +285,6 @@ def continual_clip(cfg: DictConfig) -> None:
         run_class_incremental(cfg, device)
 
     
-
 if __name__ == "__main__":
     continual_clip()
 

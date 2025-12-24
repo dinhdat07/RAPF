@@ -35,38 +35,6 @@ mix_bias: 0.7
 threshold: 0.6
 shrinkage: True
 engine:
-  enable_otf: true
-  otf_text: true
-  otf_visual: true
-  ptk: true
-  alpha: 0.7
-  topk: 5
-  descriptor_json: "chat/imagenetr_des.json"
-  text_template: "a photo of a {}"
-  num_prompts_cap: 8
   lambda_img: 0.5
-  lambda_txt: 2.0
-  replay_alpha: 0.25
   sample_num: 0
-  rerank: 0.5
-  stat: 0.8
   sample_noise: 0.25
-  templates:
-  - a photo of a {}.
-  - a blurry photo of a {}.
-  - a black and white photo of a {}.
-  - a low contrast photo of a {}.
-  - a high contrast photo of a {}.
-  - a bad photo of a {}.
-  - a good photo of a {}.
-  - a photo of a small {}.
-  - a photo of a big {}.
-  - a photo of the {}.
-  - a blurry photo of the {}.
-  - a black and white photo of the {}.
-  - a low contrast photo of the {}.
-  - a high contrast photo of the {}.
-  - a bad photo of the {}.
-  - a good photo of the {}.
-  - a photo of the small {}.
-  - a photo of the big {}.
