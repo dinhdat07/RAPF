@@ -1,4 +1,4 @@
-﻿hydra:
+﻿﻿hydra:
   run:
     dir: ./experiments/${scenario}/${dataset}_${initial_increment}-${increment}_without_exp
   job:
@@ -35,7 +35,7 @@ threshold: 0.55
 shrinkage: false
 
 use_fsa: true
-lambda_anchor: 0.5
+lambda_anchor: 2
 
 engine:
   lambda_img: 0.5

@@ -11,14 +11,13 @@ import torch.nn.functional as F
 
 from .utils import get_class_ids_per_task, get_class_names
 
-import copy
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
 
 class FSAAdapter(nn.Module):
+    """
+    Function-Space Anchoring (FSA) Adapter.
+    
+    FIXED version with correct forward_delta behavior.
+    """
     def __init__(self, c_in, hidden, dropout=0.1, use_layernorm=True, learnable_scale=True):
         super(FSAAdapter, self).__init__()
 
@@ -37,7 +36,7 @@ class FSAAdapter(nn.Module):
         else:
             self.register_buffer("scale", torch.tensor(1.0))
         
-        # FSA-specific: frozen snapshot of previous adapter
+        # FSA: Frozen snapshot of previous adapter
         self.frozen_snapshot = None
         
         self._init_weights()
@@ -50,12 +49,17 @@ class FSAAdapter(nn.Module):
 
     def forward(self, x, return_delta=False):
         residual = x
+        
         if self.use_layernorm:
             x = self.layernorm(x)
         x = self.down_proj(x)
         x = self.ln_hidden(x)
         x = self.non_linear(x)
-        x = self.dropout(x)
+        
+        # CRITICAL: Skip dropout when computing FSA loss (return_delta=True)
+        if not return_delta and self.training:
+            x = self.dropout(x)
+        
         x = self.up_proj(x)
         delta = x * self.scale
 
@@ -71,32 +75,32 @@ class FSAAdapter(nn.Module):
             return self.frozen_snapshot(x, return_delta=True)
 
     def create_snapshot(self):
-        # Deep copy current adapter and freeze all parameters
         snapshot = copy.deepcopy(self)
         for param in snapshot.parameters():
             param.requires_grad = False
         snapshot.eval()
         
         self.frozen_snapshot = snapshot
+        print(f"[FSA] Snapshot created successfully")
         return snapshot
 
     def get_anchor_loss(self, replay_features):
         if self.frozen_snapshot is None:
             return torch.tensor(0.0, device=replay_features.device)
         
-        # Current adapter output
+        if replay_features.shape[0] == 0:
+            return torch.tensor(0.0, device=replay_features.device)
+        
         delta_current = self.forward(replay_features, return_delta=True)
-        
-        # Frozen adapter output (no grad)
         delta_frozen = self.forward_frozen(replay_features)
-        
-        # L2 distance in function space
         anchor_loss = F.mse_loss(delta_current, delta_frozen)
         
         return anchor_loss
 
 
+# Backward compatibility
 class Adapter(FSAAdapter):
+    """Drop-in replacement for original Adapter."""
     pass
 
 
@@ -111,6 +115,7 @@ def shrink_cov(cov):
     alpha2  = 1
     cov_ = cov + (alpha1*diag_mean*iden) + (alpha2*off_diag_mean*(1-iden))
     return cov_
+
 
 def sample(mean, cov, size, shrink=False):
     vec = torch.randn(size, mean.shape[-1], device=mean.device)
@@ -152,14 +157,14 @@ class ClassIncrementalCLIP(nn.Module):
         self.clip_type = model.dtype
         self.tokenize = clip.tokenize
 
-        # per-task image adapters
+        # Per-task image adapters
         self.engine_cfg = getattr(cfg, 'engine', None)
         self.lambda_img = float(getattr(self.engine_cfg, 'lambda_img', 0.0)) if self.engine_cfg else 0.0
         self.replay_sample_num = int(getattr(self.engine_cfg, 'sample_num', 0)) if self.engine_cfg else 0
         self.sample_noise = float(getattr(self.engine_cfg, 'sample_noise', 0.25)) if self.engine_cfg else 0.25
         self.image_injection = nn.ModuleList()
-        self.prev_image_injection = None
 
+        # FSA configuration
         self.use_fsa = bool(getattr(cfg, "use_fsa", False))
         self.lambda_anchor = float(getattr(cfg, "lambda_anchor", 0.0))
 
@@ -170,7 +175,8 @@ class ClassIncrementalCLIP(nn.Module):
         self.nearest_class = None
         self.class_edge_distance = []
 
-    
+        print(f"[FSA] Initialized with use_fsa={self.use_fsa}, lambda_anchor={self.lambda_anchor}")
+
     def get_trainable_parameters(self):
         params = []
         if self.image_injection and len(self.image_injection) > 0:
@@ -196,36 +202,49 @@ class ClassIncrementalCLIP(nn.Module):
             param.requires_grad = False
 
     def update_injection_units(self, noise_std=0.01):
-        # create snapshot of last adapter for FSA before freezing
-        if self.use_fsa and self.image_injection:
+        # STEP 1: Create snapshot of current adapter (if FSA enabled)
+        if self.use_fsa and len(self.image_injection) > 0:
             last_adapter = self.image_injection[-1]
             last_adapter.create_snapshot()
+            print(f"[FSA] Created snapshot for adapter {len(self.image_injection)-1}")
 
+        # STEP 2: Freeze all existing adapters
         for inj in self.image_injection: 
             self.freeze(inj)
 
         dropout_rate = float(getattr(self.cfg, 'dropout', 0.1))
 
+        # STEP 3: Create new adapter
         if self.image_injection:
+            # Copy from previous adapter
             new_image_adapter = copy.deepcopy(self.image_injection[-1])
+            
+            # Add small noise
             for param in new_image_adapter.parameters():
                 param.data += noise_std * torch.randn_like(param.data)
                 param.requires_grad = True 
             
+            # Reset scale
             if hasattr(new_image_adapter, 'scale'):
                 with torch.no_grad():
-                    new_image_adapter.scale.fill_(1.0) 
+                    new_image_adapter.scale.fill_(1.0)
+            
+            # Clear frozen snapshot from copied adapter
             if hasattr(new_image_adapter, "frozen_snapshot"):
                 new_image_adapter.frozen_snapshot = None
             
             self.image_injection.append(new_image_adapter.to(self.device).to(dtype=self.dtype))
         else:
-            base_adapter = FSAAdapter(512, 256, dropout=dropout_rate) if self.use_fsa else Adapter(512, 256, dropout=dropout_rate)
+            # First adapter
+            base_adapter = FSAAdapter(512, 256, dropout=dropout_rate)
             self.image_injection.append(base_adapter.to(self.device).to(dtype=self.dtype))
+        
+        print(f"[FSA] Created adapter {len(self.image_injection)-1}")
 
     def apply_image_injection(self, features):
         if len(self.image_injection) == 0:
             return features
+        
         try:
             target_dtype = next(self.image_injection[0].parameters()).dtype
         except StopIteration:
@@ -233,16 +252,25 @@ class ClassIncrementalCLIP(nn.Module):
             
         features = features.to(dtype=target_dtype)
         task_output = self.image_injection[-1](features)
-        outputs = task_output
-        return outputs
+        return task_output
 
     def compute_fsa_loss(self, replay_features):
-        if not self.use_fsa or replay_features is None or len(self.image_injection) == 0:
+        if not self.use_fsa or replay_features is None:
             return torch.tensor(0.0, device=self.device)
-        adapter = self.image_injection[-1]
-        if hasattr(adapter, "get_anchor_loss"):
-            return adapter.get_anchor_loss(replay_features)
-        return torch.tensor(0.0, device=self.device)
+        if len(self.image_injection) == 0:
+            return torch.tensor(0.0, device=self.device)
+        if replay_features.shape[0] == 0:
+            return torch.tensor(0.0, device=self.device)
+        
+        current_adapter = self.image_injection[-1]
+        if not hasattr(current_adapter, "get_anchor_loss"):
+            return torch.tensor(0.0, device=self.device)
+        
+        # Ensure correct dtype
+        replay_features = replay_features.to(dtype=self.dtype)
+        # Compute anchor loss
+        anchor_loss = current_adapter.get_anchor_loss(replay_features)
+        return anchor_loss
     
     @torch.no_grad()
     def get_class_name_features(self):
@@ -263,6 +291,7 @@ class ClassIncrementalCLIP(nn.Module):
         self.class_name_features = self.class_name_features / self.class_name_features.norm(dim=-1, p=2, keepdim=True)
         self.queue_empty = True
         self.hard_pairs = None
+        
         if task_id > 0:
             self.update_injection_units()
             dist_list = []
@@ -313,7 +342,7 @@ class ClassIncrementalCLIP(nn.Module):
             edge_sample_features = final_image_feas[-edge_num:]
             final_image_feas = final_image_feas[:-edge_num]
 
-        #---------- text features ---------
+        # Text features
         if hasattr(self, "class_name_features") and self.class_name_features is not None:
             text_features = self.class_name_features
         else:
@@ -323,7 +352,7 @@ class ClassIncrementalCLIP(nn.Module):
         final_text_feas = text_features
         final_text_feas = final_text_feas / final_text_feas.norm(dim=-1, keepdim=True)
 
-        #---------- logits ---------
+        # Logits
         logits_per_image = self.logit_scale.exp() * final_image_feas @ final_text_feas.t().type(final_image_feas.dtype)
         probs = logits_per_image
 
@@ -334,6 +363,7 @@ class ClassIncrementalCLIP(nn.Module):
             if edge_sample is not None:
                 return probs, final_image_feas, old_memory_feature, edge_sample_features, img_feas, raw_image_features
             return probs, final_image_feas, old_memory_feature, final_text_feas, img_feas, raw_image_features
+        
         if ori_ima_f:
             if memory_data is not None:
                 final_image_feas = final_image_feas[:-memory_data.shape[0]]
@@ -360,7 +390,7 @@ class ClassIncrementalCLIP(nn.Module):
             self.class_edge_distance.append((max_distance.mean() - max_distance.min(), max_distance.max() - max_distance.mean(), max_distance.mean()))
             self.class_mean_list.append(mean)
             self.class_cov_list.append(cov)
-    
+
 
 class DomainIncrementalCLIP(nn.Module):
     def __init__(self, cfg, device, jit=False) -> None:
@@ -381,19 +411,12 @@ class DomainIncrementalCLIP(nn.Module):
             [self.prompt_template.format(c) for c in class_names]
         ).to(self.device)
 
+
 class TaskAgnosticCLIP(nn.Module):
     pass
 
+
 def load_model(cfg: DictConfig, device: torch.device) -> nn.Module:
-    r"""Load a CLIP model in different continual scenarios.
-    
-    Arguments:
-        cfg (DictConfig): Experiment configurations.
-        device (torch.device): Device to train (or) evaluate the model on.
-        
-    Returns:
-        nn.Module: Return scenario specific CLIP model.
-    """
     if cfg.scenario == "class":
         return ClassIncrementalCLIP(cfg, device)
     elif cfg.scenario == "domain":
@@ -401,7 +424,4 @@ def load_model(cfg: DictConfig, device: torch.device) -> nn.Module:
     elif cfg.scenario == "task-aganostic":
         return TaskAgnosticCLIP(cfg, device)
     else:
-        raise ValueError(f"""
-            `{cfg.scenarios}` is not a valid scenario, 
-            Please choose from ['class', "domain', 'task-agnostic']
-        """)
+        raise ValueError(f"`{cfg.scenarios}` is not a valid scenario")

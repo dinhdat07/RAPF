@@ -75,7 +75,8 @@ def run_class_incremental(cfg, device):
             loss = torch.tensor(0.0).to(device)
             loss_hinge = torch.tensor(0.0, device=device)
             tqdm_loader = tqdm(train_loader)
-            if task_id>0:
+            
+            if task_id > 0:
                 random_class_order_list = list(range(cfg.initial_increment+(task_id-1)*cfg.increment))
                 random.shuffle(random_class_order_list)
             
@@ -86,6 +87,7 @@ def run_class_incremental(cfg, device):
                 inputs, targets = inputs.to(device), targets.to(device)
                 sg_inputs = None
                 edge_sample = None
+                
                 if task_id > 0:
                     sg_inputs = []
                     sg_targets = []
@@ -114,6 +116,7 @@ def run_class_incremental(cfg, device):
                         sg_targets.append(torch.ones(int(10*cfg.beta), dtype=torch.long, device=device)*i)
                         sg_inputs.append(proto.unsqueeze(0))
                         sg_targets.append(torch.ones(1, dtype=torch.long, device=device) * i)
+                    
                     if sg_inputs:
                         sg_inputs = torch.cat(sg_inputs, dim=0)
                         sg_targets = torch.cat(sg_targets, dim=0)
@@ -132,30 +135,33 @@ def run_class_incremental(cfg, device):
                     edge_sample = torch.cat(edge_sample, dim=0)
                     edge_p_target = torch.cat(edge_p_target, dim=0)
                     edge_n_target = torch.cat(edge_n_target, dim=0)
-                if task_id > 0:
-                    not_ini = True
-                else:
-                    not_ini = False
-
-
-                outputs, final_image_feas, __, edge_sample_features, pre_image_feas, _raw_image_feas = model(inputs, memory_data=sg_inputs, not_ini=not_ini, edge_sample=edge_sample)
                 
-                # RAPF: calculate loss hinge
-                if task_id>0 and edge_sample is not None and edge_sample_features is not None:
+                not_ini = task_id > 0
+
+                outputs, final_image_feas, __, edge_sample_features, pre_image_feas, _raw_image_feas = model(
+                    inputs, 
+                    memory_data=sg_inputs, 
+                    not_ini=not_ini, 
+                    edge_sample=edge_sample
+                )
+            
+                
+                # Hinge loss
+                loss_hinge = torch.tensor(0.0, device=device)
+                if task_id > 0 and edge_sample is not None and edge_sample_features is not None:
                     edge_sample_features = edge_sample_features / edge_sample_features.norm(dim=-1, keepdim=True)
                     edge_target_features = model.class_name_features[edge_p_target].type(edge_sample_features.dtype)
                     edge_target_features = edge_target_features / edge_target_features.norm(dim=-1, keepdim=True)
                     edge_nearest_class_features = model.class_name_features[edge_n_target].type(edge_sample_features.dtype)
                     edge_nearest_class_features = edge_nearest_class_features / edge_nearest_class_features.norm(dim=-1, keepdim=True)
+                    
                     loss_hinge = torch.relu(
                         -(edge_sample_features * edge_target_features.detach()).sum(-1)
                         + (edge_sample_features * edge_nearest_class_features.detach()).sum(-1)
                         + 0.1
                     ).mean()
-                else:
-                    loss_hinge = torch.tensor(0.0, device=device)
                 
-                # calculate aug-image contrastive loss
+                # Image augmentation loss
                 image_aug_loss = torch.tensor(0.0, device=device)
                 if model.lambda_img > 0:
                     with torch.no_grad():
@@ -165,34 +171,62 @@ def run_class_incremental(cfg, device):
                     sim_img = final_image_feas[:aug_feas.shape[0]] @ aug_feas.T
                     image_aug_loss = contrastive_loss(sim_img)
 
-                # get text features by targets and calculate clip loss
+                # CLIP loss
                 labels = [model.total_class_names[int(y)] for y in targets.tolist()]
-                texts_clip=[model.prompt_template.format(inst) for inst in labels]
+                texts_clip = [model.prompt_template.format(inst) for inst in labels]
                 with torch.no_grad():  
                     clip_tokens = model.tokenize(texts_clip).to(model.device)
                     clip_text_feas = model.encode_text(clip_tokens)
-                clip_text_feas = clip_text_feas /clip_text_feas.norm(dim=-1, keepdim=True)
+                clip_text_feas = clip_text_feas / clip_text_feas.norm(dim=-1, keepdim=True)
                 
-
-
-                # calculate contrastive loss
-                clip_loss=cliploss(final_image_feas, clip_text_feas, model.logit_scale)
-                # loss_ce = F.cross_entropy(outputs, targets.detach())
-
+                clip_loss = cliploss(final_image_feas, clip_text_feas, model.logit_scale)
+                
                 anchor_loss = torch.tensor(0.0, device=device)
-                if getattr(model, "use_fsa", False) and sg_inputs is not None:
-                    anchor_loss = model.compute_fsa_loss(sg_inputs)
+                if task_id > 0 and getattr(model, "use_fsa", False):
+                    if sg_inputs is not None and sg_inputs.shape[0] > 0:
+                        anchor_loss = model.compute_fsa_loss(sg_inputs)
                 
-                loss = clip_loss +  model.lambda_img * image_aug_loss + loss_hinge + model.lambda_anchor * anchor_loss
+                loss = (
+                    clip_loss + 
+                    model.lambda_img * image_aug_loss + 
+                    loss_hinge + 
+                    model.lambda_anchor * anchor_loss
+                )
+                
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
+                
                 tqdm_loader.set_description(
-                    f"Ep {i_epoch + 1}/{cfg.epochs} | clip_loss: {clip_loss.item():.4f} | "
-                    f"Lh: {loss_hinge.item():.4f} | FSA: {anchor_loss.item():.4f} | lr: {scheduler.get_last_lr()[0]:.4f}"
+                    f"Ep {i_epoch + 1}/{cfg.epochs} | "
+                    f"clip: {clip_loss.item():.3f} | "
+                    f"hinge: {loss_hinge.item():.3f} | "
+                    f"fsa: {anchor_loss.item():.4f} | "
+                    f"lr: {scheduler.get_last_lr()[0]:.5f}"
                 )
+                
+                if batch_id % 100 == 0 and task_id > 0 and getattr(model, "use_fsa", False):
+                    current_adapter = model.image_injection[-1]
+                    has_snapshot = current_adapter.frozen_snapshot is not None
+                    
+                    if has_snapshot and sg_inputs is not None:
+                        with torch.no_grad():
+                            sample_feats = sg_inputs[:5]
+                            current_out = current_adapter(sample_feats, return_delta=True)
+                            frozen_out = current_adapter.frozen_snapshot(sample_feats, return_delta=True)
+                            cos_sim = F.cosine_similarity(
+                                current_out.flatten(), 
+                                frozen_out.flatten(), 
+                                dim=0
+                            ).item()
+                        
+                        print(f"\n[FSA Debug] Task {task_id}, Epoch {i_epoch+1}, Batch {batch_id}")
+                        print(f"  FSA loss: {anchor_loss.item():.4f}")
+                        print(f"  Cos sim: {cos_sim:.3f}")
+                        print(f"  sg_inputs shape: {sg_inputs.shape}")
             
             scheduler.step()
+            
             for inputs, targets, task_ids in train_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
                 with torch.no_grad():
