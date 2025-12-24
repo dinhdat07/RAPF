@@ -1,4 +1,4 @@
-﻿import os
+﻿﻿import os
 
 from continual_clip.utils import engine_rerank
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
@@ -47,12 +47,19 @@ def run_class_incremental(cfg, device):
     
     # model = load_model(cfg, device)
     model = ClassIncrementalCLIP(cfg, device)
+    for name, p in model.named_parameters():
+        if (
+            "visual" in name
+            or "transformer" in name
+            or "token_embedding" in name
+        ):
+            p.requires_grad = False
     model.update_injection_units()
 
     eval_dataset, classes_names = build_cl_scenarios(cfg, is_train=False, base_transforms=model.transforms)
     train_dataset, _ = build_cl_scenarios(cfg, is_train=True, base_transforms=model.transforms)
     model.classes_names = classes_names
-    des_dict =  model._get_text_des(dataname=cfg.data_name) 
+    des_dict =  model._get_text_des(dataname='cifar224') 
     acc_list = []
     metric_logger = Logger(list_subsets=["train", "test"])
 
@@ -97,7 +104,8 @@ def run_class_incremental(cfg, device):
                     elif cfg.dataset == "cub200":
                         list_for_one_batch = [random_class_order_list[batch_id*10%len(random_class_order_list)], random_class_order_list[(batch_id*10+1)%len(random_class_order_list)], random_class_order_list[(batch_id*10+2)%len(random_class_order_list)], random_class_order_list[(batch_id*10+3)%len(random_class_order_list)], random_class_order_list[(batch_id*10+4)%len(random_class_order_list)], random_class_order_list[(batch_id*10+5)%len(random_class_order_list)], random_class_order_list[(batch_id*10+6)%len(random_class_order_list)], random_class_order_list[(batch_id*10+7)%len(random_class_order_list)], random_class_order_list[(batch_id*10+8)%len(random_class_order_list)], random_class_order_list[(batch_id*10+9)%len(random_class_order_list)]]
                     else:
-                        list_for_one_batch = random_class_order_list.copy()
+                        list_for_one_batch = [random_class_order_list[batch_id*2%len(random_class_order_list)], random_class_order_list[(batch_id*2+1)%len(random_class_order_list)]]
+                        # list_for_one_batch = random_class_order_list.copy()
                     
                     if getattr(model, 'replay_sample_num', 0) > 0:
                         k = min(len(list_for_one_batch), model.replay_sample_num)
@@ -139,7 +147,7 @@ def run_class_incremental(cfg, device):
                     not_ini = False
 
 
-                outputs, final_image_feas, __, edge_sample_features, pre_image_feas, _raw_image_feas = model(inputs, memory_data=sg_inputs, not_ini=not_ini, edge_sample=edge_sample)
+                outputs, final_image_feas, old_memory_feature, edge_sample_features, pre_image_feas, _raw_image_feas = model(inputs, memory_data=sg_inputs, not_ini=not_ini, edge_sample=edge_sample)
                 
                 # RAPF: calculate loss hinge
                 if task_id>0 and edge_sample is not None and edge_sample_features is not None:
@@ -155,6 +163,18 @@ def run_class_incremental(cfg, device):
                     ).mean()
                 else:
                     loss_hinge = torch.tensor(0.0, device=device)
+
+                # features hiện tại
+                loss_distill = torch.tensor(0.0, device=device)
+
+                if old_memory_feature is not None:
+                    cur_feat = final_image_feas[:old_memory_feature.shape[0]]
+                    loss_distill = F.mse_loss(
+                        cur_feat,
+                        old_memory_feature.detach()
+                    )
+
+                distill_w = min(5, 1.0 + 0.5 * task_id)
                 
                 # ENGINE: calculate aug-image contrastive loss
                 if model.lambda_img > 0:
@@ -196,12 +216,18 @@ def run_class_incremental(cfg, device):
                 
                 # loss =  loss_ce + loss_hinge  + clip_loss + model.lambda_img * image_aug_loss + model.lambda_txt * ref_text_loss
 
-                loss =  clip_loss +  model.lambda_img * image_aug_loss + model.lambda_txt * ref_text_loss + loss_hinge
+                loss = (
+                    clip_loss
+                    + distill_w * loss_distill
+                    + model.lambda_img * image_aug_loss
+                    + model.lambda_txt * ref_text_loss
+                    + loss_hinge
+                )
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
                 tqdm_loader.set_description(
-                    f"Ep {i_epoch + 1}/{cfg.epochs} | L: {loss.item():.4f} | Clip_loss: {clip_loss.item():.4f} | "
+                    f"Ep {i_epoch + 1}/{cfg.epochs} | L: {loss.item():.4f} | loss_distill: {loss_distill.item():.4f} | "
                     f"Li: {image_aug_loss.item():.4f} | Lt: {ref_text_loss.item():.4f} | Lh: {loss_hinge.item():.4f} | lr: {scheduler.get_last_lr()[0]:.4f}"
                 )
             
@@ -230,6 +256,7 @@ def run_class_incremental(cfg, device):
         sample_data = torch.cat(sample_data, dim=0)
         sample_after_adapt_feature = torch.cat(sample_after_adapt_feature, dim=0)
         model.analyze_mean_cov(sample_data, sample_target)
+        # model.mix_matrix()
         model.eval()
 
         eval_loader = DataLoader(eval_dataset[:task_id + 1], batch_size=cfg.batch_size, num_workers=cfg.num_workers)
@@ -237,14 +264,14 @@ def run_class_incremental(cfg, device):
             inputs, targets = inputs.to(device), targets.to(device)
             with torch.no_grad():
                 outputs, _, __, ___, _pre_image_feas, raw_image_feas = model(inputs)
-                outputs = engine_rerank(
-                    model=model,
-                    device=device,
-                    epoch=epochs - 1,
-                    cfg=cfg,
-                    outputs=outputs,
-                    raw_image_feas=raw_image_feas,
-                )
+                # outputs = engine_rerank(
+                #     model=model,
+                #     device=device,
+                #     epoch=epochs - 1,
+                #     cfg=cfg,
+                #     outputs=outputs,
+                #     raw_image_feas=raw_image_feas,
+                # )
                 torch.nn.functional.softmax(outputs, dim=-1)
             metric_logger.add([outputs.cpu().argmax(dim=1), targets.cpu(), task_ids], subset="test")
 

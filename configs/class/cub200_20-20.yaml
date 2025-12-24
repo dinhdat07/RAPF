@@ -11,29 +11,29 @@
 
 class_order: ""
 dataset_root: " "
+dataset: "cub200"
 workdir: ""
 log_path: "metric.json"
 model_name: "ViT-B/16"
-prompt_template: "a photo of a {}."
+prompt_template: "a good photo of a {}."
 
-batch_size: 64
-train_batch_size: 64
-num_workers: 8
+batch_size: 32
+train_batch_size: 32
+num_workers: 16
 initial_increment: 20
 increment: ${initial_increment}
 scenario: "class"
 dataset: "cub200"
-data_name: "cub"
 
-epochs: 20
-lr: 0.01
+epochs: 15
+lr: 0.001
 fp16: false
-seed: 1993
+seed: 2
 milestones: [4, 10]
 
-beta: 0.5
+beta: 1
 mix_bias: 0.6
-threshold: 0.55
+threshold: 0.65
 shrinkage: false
 
 engine:
@@ -46,29 +46,13 @@ engine:
   descriptor_json: "chat/cub_des.json"
   text_template: "a photo of a {}"
   num_prompts_cap: 8
-  lambda_img: 0.5
+  lambda_img: 2
   lambda_txt: 2
   replay_alpha: 0.25
   sample_num: 0
-  rerank: 0.5
+  rerank: 0.8
   stat: 0.8
-  sample_noise: 0.25
+  sample_noise: 0.3
   templates:
-    - a photo of a {}.
-    - a blurry photo of a {}.
-    - a black and white photo of a {}.
-    - a low contrast photo of a {}.
-    - a high contrast photo of a {}.
-    - a bad photo of a {}.
-    - a good photo of a {}.
-    - a photo of a small {}.
-    - a photo of a big {}.
-    - a photo of the {}.
-    - a blurry photo of the {}.
-    - a black and white photo of the {}.
-    - a low contrast photo of the {}.
-    - a high contrast photo of the {}.
-    - a bad photo of the {}.
-    - a good photo of the {}.
-    - a photo of the small {}.
-    - a photo of the big {}.
+    - a photo of a {}, a type of bird.
+ 

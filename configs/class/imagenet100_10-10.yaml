@@ -27,16 +27,12 @@ train_batch_size: 128
 epochs: 15
 lr: 0.001
 fp16: false
-seed: 2
+seed: 1993
 milestones: [4,10]
 beta: 1
 mix_bias: 0.5
 threshold: 0.65
 shrinkage: False
-enable_engine_otf: null
-enable_engine_ptk: null
-engine_descriptor_json: ""
-engine_alpha: null
 
 engine:
   enable_otf: false
@@ -45,16 +41,22 @@ engine:
   ptk: false
   alpha: 0.7
   topk: 5
-  descriptor_json: "resources/engine_descriptors.json"
+  descriptor_json: "chat/imagenetr_des.json"
   text_template: "a photo of a {}, detailed"
   num_prompts_cap: 8
-  lambda_img: 2.0
+  lambda_img: 1.0
   lambda_txt: 2.0
   replay_alpha: 0.25
   sample_num: 0
-  strong_aug:
-    randaugment_n: 2
-    randaugment_m: 9
-    color_jitter: [0.4, 0.4, 0.4, 0.1]
-    random_erasing_p: 0.25
+  rerank: 0.5
+  stat: 0.8
+  sample_noise: 0.25
+  templates:
+  - itap of a {}.
+  - a bad photo of the {}..
+  - a origami {}.
+  - a photo of the large {}.
+  - a {} in a video game.
+  - art of the {}.
+  - a photo of the small {}.
 

@@ -12,17 +12,18 @@ class_order: ''
 dataset_root: ''
 workdir: ''
 log_path: metric.json
-model_name: ViT-B-16
+model_name: ViT-B/16
 prompt_template: a photo of a {}.
+
 batch_size: 64
-initial_increment: 10
+initial_increment: 5
 increment: ${initial_increment}
 scenario: class
 dataset: cifar100
 num_workers: 8
 train_batch_size: 64
 epochs: 10
-lr: 0.05
+lr: 0.01
 fp16: false
 seed: 1993
 milestones:

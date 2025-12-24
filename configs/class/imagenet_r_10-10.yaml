@@ -45,8 +45,10 @@ shrinkage: false
 # ==== ENGINE ====
 engine:
   enable_otf: true
+  enable_otf: true
   otf_text: true
   otf_visual: true
+  ptk: true
   ptk: true
   alpha: 0.7
   topk: 5
@@ -61,21 +63,13 @@ engine:
   stat: 0.8
   sample_noise: 0.25
   templates:
-    - a photo of a {}.
-    - a blurry photo of a {}.
-    - a black and white photo of a {}.
-    - a low contrast photo of a {}.
-    - a high contrast photo of a {}.
-    - a bad photo of a {}.
-    - a good photo of a {}.
-    - a photo of a small {}.
-    - a photo of a big {}.
-    - a photo of the {}.
-    - a blurry photo of the {}.
-    - a black and white photo of the {}.
-    - a low contrast photo of the {}.
-    - a high contrast photo of the {}.
+    - itap of a {}.
     - a bad photo of the {}.
-    - a good photo of the {}.
+    - a origami {}.
+    - a photo of the large {}.
+    - a high contrast photo of a {}.
+    - a {} in a video game.
+    - art of the {}.
+    - a photo of a small {}.
     - a photo of the small {}.
-    - a photo of the big {}.
+

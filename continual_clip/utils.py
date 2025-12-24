@@ -31,14 +31,10 @@ def get_dataset_class_names(workdir, dataset_name, long=False):
     return [line.split("\t")[-1] for line in lines]
 
 
+
 def save_config(config: DictConfig) -> None:
     OmegaConf.save(config, "config.yaml")
 
-
-# def get_workdir(path):
-#     split_path = path.split("/")
-#     workdir_idx = split_path.index("RAPF") # If a 'ValueError' occurs, replace 'RAPF' with your actual work directory
-#     return "/".join(split_path[:workdir_idx+1])
 
 def get_workdir(path):
     split_path = list(Path(path).resolve().parts)
@@ -62,43 +58,32 @@ def get_engine_descriptor_path(workdir: str, dataset_name: str) -> Optional[str]
     candidate_path = os.path.normpath(os.path.join(workdir, candidate))
     return candidate_path if os.path.isfile(candidate_path) else None
 
+def normalize_key(name: str):
+    return name.replace("_", " ").lower()
 
-def engine_rerank(model, outputs, raw_image_feas, device, epoch, cfg):
-    """
-    Rerank batch outputs dựa trên GDA + knowledge injection.
+def engine_rerank(model, outputs, raw_image_feas, device, cfg):
 
-    Parameters:
-    - outputs: logits batch hiện tại (batch_size x num_classes)
-    - raw_image_feas: đặc trưng ảnh từ backbone CLIP (chưa qua injection)
-    - device: CPU/GPU
-    - epoch: epoch hiện tại
-    - cfg: config
-    """
-    model.eval()
     with torch.no_grad():
-        if hasattr(cfg, "epochs") and epoch == cfg.epochs - 1:
+        if hasattr(cfg, "epochs") and epoch == cfg.epochs:
             # GDA classifier
             outputs_gda = raw_image_feas @ model.W + model.b
             outputs_gda = outputs_gda / outputs_gda.norm(dim=-1, keepdim=True)
 
-            # Rerank batch
-            outputs_rerank = model.rerank(
-                des_dict=model.des_dict,
-                outputs=outputs,
-                image_features_raw=raw_image_feas,
-                class_names=model.total_class_names,
-                device=device,
-                topk=cfg.engine.topk
-            )
+        # Rerank batch
+        outputs_rerank = model.rerank(
+            des_dict=model.des_dict,
+            outputs=outputs,
+            image_features_raw=raw_image_feas,
+            class_names=model.total_class_names,
+            device=device,
+            topk=cfg.engine.topk
+        )
 
-            # Kết hợp GDA + rerank + original outputs
-            outputs = (
-                outputs_gda * cfg.engine.stat
-                + (cfg.engine.rerank * outputs_rerank
-                   + (1 - cfg.engine.rerank) * outputs) * (1 - cfg.engine.stat)
-            )
-        else:
-            # Nếu chưa đến tuned_epoch, trả về outputs bình thường
-            outputs = outputs
+        # GDA + rerank + original outputs
+        outputs = (
+            outputs_gda * cfg.engine.stat
+            + (cfg.engine.rerank * outputs_rerank
+                + (1 - cfg.engine.rerank) * outputs) * (1 - cfg.engine.stat)
+        )
 
     return outputs
