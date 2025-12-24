@@ -81,22 +81,18 @@ class FSAAdapter(nn.Module):
         snapshot.eval()
         
         self.frozen_snapshot = snapshot
-        print(f"[FSA] Snapshot created successfully")
         return snapshot
 
     def get_anchor_loss(self, replay_features):
         if self.frozen_snapshot is None:
-            print("calculated not success because no frozen snapshot")
             return torch.tensor(0.0, device=replay_features.device)
         
         if replay_features.shape[0] == 0:
-            print("calculated not success because no replay features")
             return torch.tensor(0.0, device=replay_features.device)
         
         delta_current = self.forward(replay_features, return_delta=True)
         delta_frozen = self.forward_frozen(replay_features)
         anchor_loss = F.mse_loss(delta_current, delta_frozen)
-        print(f"calculated: {anchor_loss}")
         
         return anchor_loss
 
@@ -260,13 +256,10 @@ class ClassIncrementalCLIP(nn.Module):
 
     def compute_fsa_loss(self, replay_features):
         if not self.use_fsa or replay_features is None:
-            print("no replay")
             return torch.tensor(0.0, device=self.device)
         if len(self.image_injection) == 0:
-            print("no adapter")
             return torch.tensor(0.0, device=self.device)
         if replay_features.shape[0] == 0:
-            print("no replay")
             return torch.tensor(0.0, device=self.device)
         
         current_adapter = self.image_injection[-1]
@@ -274,7 +267,6 @@ class ClassIncrementalCLIP(nn.Module):
         # Ensure correct dtype
         replay_features = replay_features.to(dtype=self.dtype)
         # Compute anchor loss
-        print("calculating...")
         anchor_loss = current_adapter.get_anchor_loss(replay_features)
         return anchor_loss
     

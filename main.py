@@ -63,8 +63,7 @@ def run_class_incremental(cfg, device):
         model.train()
 
         trainable_params = list(model.get_trainable_parameters())
-        optimizer = torch.optim.AdamW(trainable_params, lr=cfg.lr, weight_decay=0.05)
-        milestones = cfg.milestones
+        optimizer = torch.optim.AdamW(trainable_params, lr=cfg.lr, weight_decay=0.005)
         epochs = cfg.epochs
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=0)
 
