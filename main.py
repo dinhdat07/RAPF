@@ -1,4 +1,4 @@
-﻿﻿import os
+﻿import os
 
 from continual_clip.utils import engine_rerank
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
@@ -72,7 +72,7 @@ def run_class_incremental(cfg, device):
         model.train()
 
         trainable_params = list(model.get_trainable_parameters())
-        optimizer = torch.optim.AdamW(trainable_params, lr=cfg.lr, weight_decay=0.05)
+        optimizer = torch.optim.AdamW(trainable_params, lr=cfg.lr, weight_decay=0.005)
         milestones = cfg.milestones
         epochs = cfg.epochs
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=0)
@@ -97,7 +97,7 @@ def run_class_incremental(cfg, device):
                 if task_id > 0:
                     sg_inputs = []
                     sg_targets = []
-                    if cfg.dataset == "cifar100" and cfg.increment == 5:
+                    if cfg.dataset == "cifar100":
                         list_for_one_batch = [random_class_order_list[batch_id*4%len(random_class_order_list)], random_class_order_list[(batch_id*4+1)%len(random_class_order_list)], random_class_order_list[(batch_id*4+2)%len(random_class_order_list)], random_class_order_list[(batch_id*4+3)%len(random_class_order_list)]]
                     elif cfg.dataset == "imagenet_R":
                         list_for_one_batch = [random_class_order_list[batch_id*5%len(random_class_order_list)], random_class_order_list[(batch_id*5+1)%len(random_class_order_list)], random_class_order_list[(batch_id*5+2)%len(random_class_order_list)], random_class_order_list[(batch_id*5+3)%len(random_class_order_list)], random_class_order_list[(batch_id*5+4)%len(random_class_order_list)]]
@@ -176,8 +176,6 @@ def run_class_incremental(cfg, device):
 
                 distill_w = min(5, 1.0 + 0.5 * task_id)
                 
-
-                image_aug_loss = torch.tensor(0.0, device=device)
                 # ENGINE: calculate aug-image contrastive loss
                 if model.lambda_img > 0:
                     with torch.no_grad():
@@ -186,6 +184,8 @@ def run_class_incremental(cfg, device):
                     aug_feas = aug_feas / aug_feas.norm(dim=-1, keepdim=True)
                     sim_img = final_image_feas[:aug_feas.shape[0]] @ aug_feas.T
                     image_aug_loss = contrastive_loss(sim_img)
+                else:
+                    image_aug_loss = 0
 
                 # ENGINE: get text features by targets and calculate text-des loss
                 labels = [model.total_class_names[int(y)] for y in targets.tolist()]
@@ -196,7 +196,6 @@ def run_class_incremental(cfg, device):
                 clip_text_feas = model.apply_text_injection(clip_text_feas)
                 clip_text_feas = clip_text_feas /clip_text_feas.norm(dim=-1, keepdim=True)
 
-                ref_text_loss = torch.tensor(0.0, device=device)
                 if model.lambda_txt > 0:
                     repeat_ = 1 
                     ref_text_loss_list = []
@@ -214,11 +213,6 @@ def run_class_incremental(cfg, device):
                 
                 clip_loss=cliploss(final_image_feas, clip_text_feas, model.logit_scale)
 
-                # RAPF: calculate contrastive loss
-                # loss_ce = F.cross_entropy(outputs, targets.detach())
-                
-                # loss =  loss_ce + loss_hinge  + clip_loss + model.lambda_img * image_aug_loss + model.lambda_txt * ref_text_loss
-
                 loss = (
                     clip_loss
                     + distill_w * loss_distill
@@ -226,6 +220,7 @@ def run_class_incremental(cfg, device):
                     + model.lambda_txt * ref_text_loss
                     + loss_hinge
                 )
+                
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
@@ -259,7 +254,6 @@ def run_class_incremental(cfg, device):
         sample_data = torch.cat(sample_data, dim=0)
         sample_after_adapt_feature = torch.cat(sample_after_adapt_feature, dim=0)
         model.analyze_mean_cov(sample_data, sample_target)
-        # model.mix_matrix()
         model.eval()
 
         eval_loader = DataLoader(eval_dataset[:task_id + 1], batch_size=cfg.batch_size, num_workers=cfg.num_workers)

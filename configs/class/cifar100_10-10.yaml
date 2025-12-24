@@ -16,7 +16,7 @@ model_name: ViT-B/16
 prompt_template: a photo of a {}.
 
 batch_size: 64
-initial_increment: 5
+initial_increment: 10
 increment: ${initial_increment}
 scenario: class
 dataset: cifar100
@@ -29,7 +29,7 @@ seed: 1993
 milestones:
 - 4
 - 10
-beta: 0.5
+beta: 4
 mix_bias: 0.6
 threshold: 0.55
 shrinkage: false

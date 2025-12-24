@@ -441,8 +441,6 @@ class ClassIncrementalCLIP(nn.Module):
                     
         return outputs
     
-
-    # ... (Các hàm còn lại giữ nguyên) ...
     
     @torch.no_grad()
     def get_class_name_features(self):
@@ -546,7 +544,6 @@ class ClassIncrementalCLIP(nn.Module):
         #---------- logits ---------
         logits_per_image = self.logit_scale.exp() * final_image_feas @ final_text_feas.t().type(final_image_feas.dtype)
         probs = logits_per_image
-
 
         if not_ini:
             with torch.no_grad():
