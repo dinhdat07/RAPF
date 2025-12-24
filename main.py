@@ -1,6 +1,5 @@
 ﻿import os
 
-from continual_clip.utils import engine_rerank
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import json
 import pdb
@@ -177,10 +176,10 @@ def run_class_incremental(cfg, device):
                 
 
                 # calculate contrastive loss
-                # clip_loss=cliploss(final_image_feas, clip_text_feas, model.logit_scale)
-                loss_ce = F.cross_entropy(outputs, targets.detach())
+                clip_loss=cliploss(final_image_feas, clip_text_feas, model.logit_scale)
+                # loss_ce = F.cross_entropy(outputs, targets.detach())
                 
-                loss =  loss_ce +  model.lambda_img * image_aug_loss + loss_hinge
+                loss = clip_loss +  model.lambda_img * image_aug_loss + loss_hinge
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
