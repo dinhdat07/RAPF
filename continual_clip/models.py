@@ -86,14 +86,17 @@ class FSAAdapter(nn.Module):
 
     def get_anchor_loss(self, replay_features):
         if self.frozen_snapshot is None:
+            print("calculated not success because no frozen snapshot")
             return torch.tensor(0.0, device=replay_features.device)
         
         if replay_features.shape[0] == 0:
+            print("calculated not success because no replay features")
             return torch.tensor(0.0, device=replay_features.device)
         
         delta_current = self.forward(replay_features, return_delta=True)
         delta_frozen = self.forward_frozen(replay_features)
         anchor_loss = F.mse_loss(delta_current, delta_frozen)
+        print(f"calculated: {anchor_loss}")
         
         return anchor_loss
 
@@ -202,44 +205,45 @@ class ClassIncrementalCLIP(nn.Module):
             param.requires_grad = False
 
     def update_injection_units(self, noise_std=0.01):
-        # STEP 1: Create snapshot of current adapter (if FSA enabled)
+        prev_adapter = None
+
+        # 1) Nếu có adapter cũ thì tạo snapshot
         if self.use_fsa and len(self.image_injection) > 0:
-            last_adapter = self.image_injection[-1]
-            last_adapter.create_snapshot()
+            prev_adapter = self.image_injection[-1]
+            prev_adapter.create_snapshot()
             print(f"[FSA] Created snapshot for adapter {len(self.image_injection)-1}")
 
-        # STEP 2: Freeze all existing adapters
-        for inj in self.image_injection: 
+        # 2) Freeze các adapter hiện có
+        for inj in self.image_injection:
             self.freeze(inj)
 
         dropout_rate = float(getattr(self.cfg, 'dropout', 0.1))
 
-        # STEP 3: Create new adapter
+        # 3) Tạo adapter mới
         if self.image_injection:
-            # Copy from previous adapter
             new_image_adapter = copy.deepcopy(self.image_injection[-1])
-            
-            # Add small noise
-            for param in new_image_adapter.parameters():
-                param.data += noise_std * torch.randn_like(param.data)
-                param.requires_grad = True 
-            
+
+            # IMPORTANT: đảm bảo frozen_snapshot của adapter mới trỏ tới snapshot của adapter cũ
+            if self.use_fsa and prev_adapter is not None:
+                new_image_adapter.frozen_snapshot = prev_adapter.frozen_snapshot
+
+            # Add noise + mở grad cho adapter mới (chỉ các params của adapter mới)
+            for p in new_image_adapter.parameters():
+                p.requires_grad = True
+                p.data.add_(noise_std * torch.randn_like(p.data))
+
             # Reset scale
-            if hasattr(new_image_adapter, 'scale'):
+            if hasattr(new_image_adapter, "scale"):
                 with torch.no_grad():
                     new_image_adapter.scale.fill_(1.0)
-            
-            # Clear frozen snapshot from copied adapter
-            if hasattr(new_image_adapter, "frozen_snapshot"):
-                new_image_adapter.frozen_snapshot = None
-            
+
             self.image_injection.append(new_image_adapter.to(self.device).to(dtype=self.dtype))
         else:
-            # First adapter
             base_adapter = FSAAdapter(512, 256, dropout=dropout_rate)
             self.image_injection.append(base_adapter.to(self.device).to(dtype=self.dtype))
-        
+
         print(f"[FSA] Created adapter {len(self.image_injection)-1}")
+
 
     def apply_image_injection(self, features):
         if len(self.image_injection) == 0:
@@ -256,19 +260,21 @@ class ClassIncrementalCLIP(nn.Module):
 
     def compute_fsa_loss(self, replay_features):
         if not self.use_fsa or replay_features is None:
+            print("no replay")
             return torch.tensor(0.0, device=self.device)
         if len(self.image_injection) == 0:
+            print("no adapter")
             return torch.tensor(0.0, device=self.device)
         if replay_features.shape[0] == 0:
+            print("no replay")
             return torch.tensor(0.0, device=self.device)
         
         current_adapter = self.image_injection[-1]
-        if not hasattr(current_adapter, "get_anchor_loss"):
-            return torch.tensor(0.0, device=self.device)
         
         # Ensure correct dtype
         replay_features = replay_features.to(dtype=self.dtype)
         # Compute anchor loss
+        print("calculating...")
         anchor_loss = current_adapter.get_anchor_loss(replay_features)
         return anchor_loss
     

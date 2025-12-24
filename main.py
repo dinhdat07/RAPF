@@ -184,6 +184,7 @@ def run_class_incremental(cfg, device):
                 anchor_loss = torch.tensor(0.0, device=device)
                 if task_id > 0 and getattr(model, "use_fsa", False):
                     if sg_inputs is not None and sg_inputs.shape[0] > 0:
+                        print("calculate anchor loss")
                         anchor_loss = model.compute_fsa_loss(sg_inputs)
                 
                 loss = (
