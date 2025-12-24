@@ -11,20 +11,24 @@ import torch.nn.functional as F
 
 from .utils import get_class_ids_per_task, get_class_names
 
-class Adapter(nn.Module):
+import copy
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class FSAAdapter(nn.Module):
     def __init__(self, c_in, hidden, dropout=0.1, use_layernorm=True, learnable_scale=True):
-        super(Adapter, self).__init__()
+        super(FSAAdapter, self).__init__()
 
         self.use_layernorm = use_layernorm
         if use_layernorm:
             self.layernorm = nn.LayerNorm(c_in)
 
         self.down_proj = nn.Linear(c_in, hidden)
-        
         self.ln_hidden = nn.LayerNorm(hidden)
-
         self.non_linear = nn.GELU()
-        
         self.up_proj = nn.Linear(hidden, c_in)
         self.dropout = nn.Dropout(dropout)
 
@@ -33,12 +37,18 @@ class Adapter(nn.Module):
         else:
             self.register_buffer("scale", torch.tensor(1.0))
         
+        # FSA-specific: frozen snapshot of previous adapter
+        self.frozen_snapshot = None
+        
+        self._init_weights()
+
+    def _init_weights(self):
         nn.init.kaiming_uniform_(self.down_proj.weight, a=math.sqrt(5))
         nn.init.zeros_(self.up_proj.weight)
         nn.init.zeros_(self.down_proj.bias)
         nn.init.zeros_(self.up_proj.bias)
 
-    def forward(self, x):
+    def forward(self, x, return_delta=False):
         residual = x
         if self.use_layernorm:
             x = self.layernorm(x)
@@ -47,9 +57,47 @@ class Adapter(nn.Module):
         x = self.non_linear(x)
         x = self.dropout(x)
         x = self.up_proj(x)
-        x = x * self.scale
+        delta = x * self.scale
 
-        return residual + x
+        if return_delta:
+            return delta
+        return residual + delta
+
+    def forward_frozen(self, x):
+        if self.frozen_snapshot is None:
+            return torch.zeros_like(x)
+        
+        with torch.no_grad():
+            return self.frozen_snapshot(x, return_delta=True)
+
+    def create_snapshot(self):
+        # Deep copy current adapter and freeze all parameters
+        snapshot = copy.deepcopy(self)
+        for param in snapshot.parameters():
+            param.requires_grad = False
+        snapshot.eval()
+        
+        self.frozen_snapshot = snapshot
+        return snapshot
+
+    def get_anchor_loss(self, replay_features):
+        if self.frozen_snapshot is None:
+            return torch.tensor(0.0, device=replay_features.device)
+        
+        # Current adapter output
+        delta_current = self.forward(replay_features, return_delta=True)
+        
+        # Frozen adapter output (no grad)
+        delta_frozen = self.forward_frozen(replay_features)
+        
+        # L2 distance in function space
+        anchor_loss = F.mse_loss(delta_current, delta_frozen)
+        
+        return anchor_loss
+
+
+class Adapter(FSAAdapter):
+    pass
 
 
 def shrink_cov(cov):
