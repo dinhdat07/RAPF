@@ -176,6 +176,8 @@ def run_class_incremental(cfg, device):
 
                 distill_w = min(5, 1.0 + 0.5 * task_id)
                 
+
+                image_aug_loss = torch.tensor(0.0, device=device)
                 # ENGINE: calculate aug-image contrastive loss
                 if model.lambda_img > 0:
                     with torch.no_grad():
@@ -194,6 +196,7 @@ def run_class_incremental(cfg, device):
                 clip_text_feas = model.apply_text_injection(clip_text_feas)
                 clip_text_feas = clip_text_feas /clip_text_feas.norm(dim=-1, keepdim=True)
 
+                ref_text_loss = torch.tensor(0.0, device=device)
                 if model.lambda_txt > 0:
                     repeat_ = 1 
                     ref_text_loss_list = []
@@ -264,14 +267,6 @@ def run_class_incremental(cfg, device):
             inputs, targets = inputs.to(device), targets.to(device)
             with torch.no_grad():
                 outputs, _, __, ___, _pre_image_feas, raw_image_feas = model(inputs)
-                # outputs = engine_rerank(
-                #     model=model,
-                #     device=device,
-                #     epoch=epochs - 1,
-                #     cfg=cfg,
-                #     outputs=outputs,
-                #     raw_image_feas=raw_image_feas,
-                # )
                 torch.nn.functional.softmax(outputs, dim=-1)
             metric_logger.add([outputs.cpu().argmax(dim=1), targets.cpu(), task_ids], subset="test")
 
