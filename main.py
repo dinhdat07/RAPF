@@ -90,14 +90,13 @@ def run_class_incremental(cfg, device):
                     sg_inputs = []
                     sg_targets = []
                     if cfg.dataset == "cifar100" and cfg.increment == 5:
-                        list_for_one_batch = random_class_order_list.copy()
-                        # list_for_one_batch = [random_class_order_list[batch_id*4%len(random_class_order_list)], random_class_order_list[(batch_id*4+1)%len(random_class_order_list)], random_class_order_list[(batch_id*4+2)%len(random_class_order_list)], random_class_order_list[(batch_id*4+3)%len(random_class_order_list)]]
+                        list_for_one_batch = [random_class_order_list[batch_id*4%len(random_class_order_list)], random_class_order_list[(batch_id*4+1)%len(random_class_order_list)], random_class_order_list[(batch_id*4+2)%len(random_class_order_list)], random_class_order_list[(batch_id*4+3)%len(random_class_order_list)]]
                     elif cfg.dataset == "imagenet_R":
                         list_for_one_batch = [random_class_order_list[batch_id*5%len(random_class_order_list)], random_class_order_list[(batch_id*5+1)%len(random_class_order_list)], random_class_order_list[(batch_id*5+2)%len(random_class_order_list)], random_class_order_list[(batch_id*5+3)%len(random_class_order_list)], random_class_order_list[(batch_id*5+4)%len(random_class_order_list)]]
                     elif cfg.dataset == "cub200":
                         list_for_one_batch = [random_class_order_list[batch_id*10%len(random_class_order_list)], random_class_order_list[(batch_id*10+1)%len(random_class_order_list)], random_class_order_list[(batch_id*10+2)%len(random_class_order_list)], random_class_order_list[(batch_id*10+3)%len(random_class_order_list)], random_class_order_list[(batch_id*10+4)%len(random_class_order_list)], random_class_order_list[(batch_id*10+5)%len(random_class_order_list)], random_class_order_list[(batch_id*10+6)%len(random_class_order_list)], random_class_order_list[(batch_id*10+7)%len(random_class_order_list)], random_class_order_list[(batch_id*10+8)%len(random_class_order_list)], random_class_order_list[(batch_id*10+9)%len(random_class_order_list)]]
                     else:
-                        list_for_one_batch = random_class_order_list.copy()
+                        list_for_one_batch = [random_class_order_list[batch_id*2%len(random_class_order_list)], random_class_order_list[(batch_id*2+1)%len(random_class_order_list)]]
                     
                     if getattr(model, 'replay_sample_num', 0) > 0:
                         k = min(len(list_for_one_batch), model.replay_sample_num)
@@ -139,7 +138,7 @@ def run_class_incremental(cfg, device):
                     not_ini = False
 
 
-                outputs, final_image_feas, __, edge_sample_features, pre_image_feas, _raw_image_feas = model(inputs, memory_data=sg_inputs, not_ini=not_ini, edge_sample=edge_sample)
+                outputs, final_image_feas, old_memory_feature, edge_sample_features, pre_image_feas, _raw_image_feas = model(inputs, memory_data=sg_inputs, not_ini=not_ini, edge_sample=edge_sample)
                 
                 # RAPF: calculate loss hinge
                 if task_id>0 and edge_sample is not None and edge_sample_features is not None:
@@ -155,8 +154,17 @@ def run_class_incremental(cfg, device):
                     ).mean()
                 else:
                     loss_hinge = torch.tensor(0.0, device=device)
+
+                loss_distill = torch.tensor(0.0, device=device)
+
+                if old_memory_feature is not None:
+                    cur_feat = final_image_feas[:old_memory_feature.shape[0]]
+                    loss_distill = F.mse_loss(cur_feat, old_memory_feature.detach())
+
+                distill_w = min(5, 1.0 + 0.5 * task_id)
                 
                 # calculate aug-image contrastive loss
+                image_aug_loss = torch.tensor(0.0, device=device)
                 if model.lambda_img > 0:
                     with torch.no_grad():
                         aug = torch.clamp(inputs + torch.randn_like(inputs) * 0.25, 0, 1)
@@ -179,12 +187,12 @@ def run_class_incremental(cfg, device):
                 clip_loss=cliploss(final_image_feas, clip_text_feas, model.logit_scale)
                 # loss_ce = F.cross_entropy(outputs, targets.detach())
                 
-                loss = clip_loss +  model.lambda_img * image_aug_loss + loss_hinge
+                loss = clip_loss + distill_w * loss_distill + model.lambda_img * image_aug_loss + loss_hinge
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
                 tqdm_loader.set_description(
-                    f"Ep {i_epoch + 1}/{cfg.epochs} | clip_loss: {clip_loss.item():.4f} | "
+                    f"Ep {i_epoch + 1}/{cfg.epochs} | loss_distill: {loss_distill.item():.4f} | "
                     f"Lh: {loss_hinge.item():.4f} | lr: {scheduler.get_last_lr()[0]:.4f}"
                 )
             
