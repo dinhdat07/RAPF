@@ -156,12 +156,12 @@ class ClassIncrementalCLIP(nn.Module):
         self.clip_type = model.dtype
         self.tokenize = clip.tokenize
 
-        # Per-task image adapters
+        # Per-task image adapters (keep only current and snapshot of previous)
         self.engine_cfg = getattr(cfg, 'engine', None)
         self.lambda_img = float(getattr(self.engine_cfg, 'lambda_img', 0.0)) if self.engine_cfg else 0.0
         self.replay_sample_num = int(getattr(self.engine_cfg, 'sample_num', 0)) if self.engine_cfg else 0
         self.sample_noise = float(getattr(self.engine_cfg, 'sample_noise', 0.25)) if self.engine_cfg else 0.25
-        self.image_injection = nn.ModuleList()
+        self.curr_adapter = None
 
         # FSA configuration
         self.use_fsa = bool(getattr(cfg, "use_fsa", False))
@@ -178,8 +178,8 @@ class ClassIncrementalCLIP(nn.Module):
 
     def get_trainable_parameters(self):
         params = []
-        if self.image_injection and len(self.image_injection) > 0:
-            params.append(self.image_injection[-1].parameters())
+        if self.curr_adapter is not None:
+            params.append(self.curr_adapter.parameters())
         return chain.from_iterable(params)
     
     def encode_text(self, text, prompt=False):
@@ -201,73 +201,49 @@ class ClassIncrementalCLIP(nn.Module):
             param.requires_grad = False
 
     def update_injection_units(self, noise_std=0.01):
-        prev_adapter = None
-
-        # 1) Nếu có adapter cũ thì tạo snapshot
-        if self.use_fsa and len(self.image_injection) > 0:
-            prev_adapter = self.image_injection[-1]
-            prev_adapter.create_snapshot()
-            print(f"[FSA] Created snapshot for adapter {len(self.image_injection)-1}")
-
-        # 2) Freeze các adapter hiện có
-        for inj in self.image_injection:
-            self.freeze(inj)
-
         dropout_rate = float(getattr(self.cfg, 'dropout', 0.1))
 
-        # 3) Tạo adapter mới
-        if self.image_injection:
-            new_image_adapter = copy.deepcopy(self.image_injection[-1])
-
-            # IMPORTANT: đảm bảo frozen_snapshot của adapter mới trỏ tới snapshot của adapter cũ
-            if self.use_fsa and prev_adapter is not None:
-                new_image_adapter.frozen_snapshot = prev_adapter.frozen_snapshot
-
-            # Add noise + mở grad cho adapter mới (chỉ các params của adapter mới)
-            for p in new_image_adapter.parameters():
-                p.requires_grad = True
+        if self.curr_adapter is not None:
+            new_adapter = copy.deepcopy(self.curr_adapter)
+            if self.use_fsa:
+                self.curr_adapter.create_snapshot()
+                print("[FSA] Created snapshot for current adapter")
+                new_adapter.frozen_snapshot = self.curr_adapter.frozen_snapshot
+                
+            for p in new_adapter.parameters():
+                p.requires_grad_(True)
                 p.data.add_(noise_std * torch.randn_like(p.data))
-
-            # Reset scale
-            if hasattr(new_image_adapter, "scale"):
+            if hasattr(new_adapter, "scale"):
                 with torch.no_grad():
-                    new_image_adapter.scale.fill_(1.0)
-
-            self.image_injection.append(new_image_adapter.to(self.device).to(dtype=self.dtype))
+                    new_adapter.scale.fill_(1.0)
+            self.curr_adapter = new_adapter.to(self.device).to(dtype=self.dtype)
         else:
             base_adapter = FSAAdapter(512, 256, dropout=dropout_rate)
-            self.image_injection.append(base_adapter.to(self.device).to(dtype=self.dtype))
+            self.curr_adapter = base_adapter.to(self.device).to(dtype=self.dtype)
 
-        print(f"[FSA] Created adapter {len(self.image_injection)-1}")
+        print("[FSA] Created/updated current adapter")
 
 
     def apply_image_injection(self, features):
-        if len(self.image_injection) == 0:
+        if self.curr_adapter is None:
             return features
         
-        try:
-            target_dtype = next(self.image_injection[0].parameters()).dtype
-        except StopIteration:
-            target_dtype = features.dtype
-            
+        target_dtype = next(self.curr_adapter.parameters()).dtype
         features = features.to(dtype=target_dtype)
-        task_output = self.image_injection[-1](features)
-        return task_output
+        return self.curr_adapter(features)
 
     def compute_fsa_loss(self, replay_features):
         if not self.use_fsa or replay_features is None:
             return torch.tensor(0.0, device=self.device)
-        if len(self.image_injection) == 0:
+        if self.curr_adapter is None:
             return torch.tensor(0.0, device=self.device)
         if replay_features.shape[0] == 0:
             return torch.tensor(0.0, device=self.device)
         
-        current_adapter = self.image_injection[-1]
-        
         # Ensure correct dtype
         replay_features = replay_features.to(dtype=self.dtype)
         # Compute anchor loss
-        anchor_loss = current_adapter.get_anchor_loss(replay_features)
+        anchor_loss = self.curr_adapter.get_anchor_loss(replay_features)
         return anchor_loss
     
     @torch.no_grad()

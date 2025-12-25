@@ -206,10 +206,10 @@ def run_class_incremental(cfg, device):
                 )
                 
                 if batch_id % 100 == 0 and task_id > 0 and getattr(model, "use_fsa", False):
-                    current_adapter = model.image_injection[-1]
-                    has_snapshot = current_adapter.frozen_snapshot is not None
+                    current_adapter = model.curr_adapter
+                    has_snapshot = current_adapter is not None and current_adapter.frozen_snapshot is not None
                     
-                    if has_snapshot and sg_inputs is not None:
+                    if has_snapshot and sg_inputs is not None and current_adapter is not None:
                         with torch.no_grad():
                             sample_feats = sg_inputs[:5]
                             current_out = current_adapter(sample_feats, return_delta=True)
