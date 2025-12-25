@@ -21,6 +21,37 @@ from continual_clip.losses import contrastive_loss
 from continual_clip.datasets import build_cl_scenarios
 import numpy as np
 
+
+def compute_lambda_anchor(lambda_base: float,
+                          epoch_scheduling: bool,
+                          task_scheduling: bool,
+                          task_id: int,
+                          num_tasks: int,
+                          epoch_idx: int,
+                          num_epochs: int,
+                          alpha: float,
+                          lambda_max: float) -> float:
+    m_epoch = 1.0
+    if epoch_scheduling:
+        p = (epoch_idx + 1) / num_epochs
+        if p <= 0.3:
+            m_epoch = 0.2
+        elif p <= 0.7:
+            m_epoch = 0.6
+        else:
+            m_epoch = 1.0
+
+    m_task = 1.0
+    if task_scheduling:
+        if num_tasks <= 1:
+            m_task = 1.0
+        else:
+            m_task = 1.0 + alpha * (task_id / (num_tasks - 1))
+
+    lambda_used = lambda_base * m_epoch * m_task
+    lambda_used = max(0.0, min(lambda_used, lambda_max))
+    return float(lambda_used)
+
 def seed_everything(seed=0):
     """Fix all random seeds"""
     random.seed(seed)
@@ -183,14 +214,27 @@ def run_class_incremental(cfg, device):
                 anchor_loss = torch.tensor(0.0, device=device)
                 if task_id > 0 and getattr(model, "use_fsa", False):
                     if sg_inputs is not None and sg_inputs.shape[0] > 0:
-                        print("calculate anchor loss")
                         anchor_loss = model.compute_fsa_loss(sg_inputs)
+
+                lambda_base = float(model.lambda_anchor)
+                num_tasks = len(eval_dataset)
+                lambda_used = compute_lambda_anchor(
+                    lambda_base=lambda_base,
+                    epoch_scheduling=getattr(cfg, "epoch_scheduling", False),
+                    task_scheduling=getattr(cfg, "task_scheduling", False),
+                    task_id=task_id,
+                    num_tasks=num_tasks,
+                    epoch_idx=i_epoch,
+                    num_epochs=cfg.epochs,
+                    alpha=getattr(cfg, "lambda_anchor_alpha", 1.0),
+                    lambda_max=getattr(cfg, "lambda_anchor_max", 0.12),
+                )
                 
                 loss = (
                     clip_loss + 
                     model.lambda_img * image_aug_loss + 
                     loss_hinge + 
-                    model.lambda_anchor * anchor_loss
+                    lambda_used * anchor_loss
                 )
                 
                 loss.backward()
@@ -201,29 +245,9 @@ def run_class_incremental(cfg, device):
                     f"Ep {i_epoch + 1}/{cfg.epochs} | "
                     f"clip: {clip_loss.item():.3f} | "
                     f"hinge: {loss_hinge.item():.3f} | "
-                    f"fsa: {anchor_loss.item():.4f} | "
+                    f"fsa: {anchor_loss.item():.4f} (lambda={lambda_used:.4f}) | "
                     f"lr: {scheduler.get_last_lr()[0]:.5f}"
                 )
-                
-                if batch_id % 100 == 0 and task_id > 0 and getattr(model, "use_fsa", False):
-                    current_adapter = model.curr_adapter
-                    has_snapshot = current_adapter is not None and current_adapter.frozen_snapshot is not None
-                    
-                    if has_snapshot and sg_inputs is not None and current_adapter is not None:
-                        with torch.no_grad():
-                            sample_feats = sg_inputs[:5]
-                            current_out = current_adapter(sample_feats, return_delta=True)
-                            frozen_out = current_adapter.frozen_snapshot(sample_feats, return_delta=True)
-                            cos_sim = F.cosine_similarity(
-                                current_out.flatten(), 
-                                frozen_out.flatten(), 
-                                dim=0
-                            ).item()
-                        
-                        print(f"\n[FSA Debug] Task {task_id}, Epoch {i_epoch+1}, Batch {batch_id}")
-                        print(f"  FSA loss: {anchor_loss.item():.4f}")
-                        print(f"  Cos sim: {cos_sim:.3f}")
-                        print(f"  sg_inputs shape: {sg_inputs.shape}")
             
             scheduler.step()
             

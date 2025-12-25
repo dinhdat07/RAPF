@@ -27,6 +27,10 @@ num_workers: 16
 train_batch_size: 64
 epochs: 15
 lr: 
+epoch_scheduling: false
+task_scheduling: false
+lambda_anchor_alpha: 1.0
+lambda_anchor_max: 0.12
 use_fsa: true
 lambda_anchor: 0.5
 fp16: false
