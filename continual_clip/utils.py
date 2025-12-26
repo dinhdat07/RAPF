@@ -15,7 +15,6 @@ def get_class_order(file_name: str) -> list:
         data = yaml.safe_load(f)
         return data["class_order"]
 
-
 def get_class_ids_per_task(args):
     yield args.class_order[:args.initial_increment]
     for i in range(args.initial_increment, len(args.class_order), args.increment):
@@ -38,40 +37,19 @@ def save_config(config: DictConfig) -> None:
 
 def get_workdir(path):
     split_path = list(Path(path).resolve().parts)
-    candidates = ["RAPF", "rapf-engine"] # If a 'ValueError' occurs, replace 'rapf_engine' with your actual work directory
+    candidates = ["RAPF"]
     workdir_idx = next(
         (i for i, part in enumerate(split_path) if part in candidates),
         None
     )
     return str(Path(*split_path[:workdir_idx+1]))
 
-def get_engine_descriptor_path(workdir: str, dataset_name: str) -> Optional[str]:
-    mapping = {
-        'cifar100': os.path.join('chat', 'cifar224_des.json'),
-        'imagenet_r': os.path.join('chat', 'imagenetr_des.json'),
-        'cub200': os.path.join('chat', 'cub_des.json'),
-    }
-    dataset_key = dataset_name.lower() if dataset_name else ''
-    candidate = mapping.get(dataset_key)
-    if not candidate:
-        return None
-    candidate_path = os.path.normpath(os.path.join(workdir, candidate))
-    return candidate_path if os.path.isfile(candidate_path) else None
-
-def normalize_key(name: str):
-    return name.replace("_", " ").lower()
-
-def gda_output(model, outputs, raw_image_feas, device, cfg):
-
+def gda_output(model, outputs, raw_image_feas, cfg):
     with torch.no_grad():
-           
         outputs_gda = raw_image_feas @ model.W + model.b
         outputs_gda = outputs_gda / outputs_gda.norm(dim=-1, keepdim=True)
 
         outputs = outputs / outputs.norm(dim=-1, keepdim=True)
-
-
-      
-        outputs =  (outputs_gda * cfg.engine.stat) + (outputs )  * (1 - cfg.engine.stat)
+        outputs =  (outputs_gda * cfg.stat) + (outputs )  * (1 - cfg.stat)
         
     return outputs

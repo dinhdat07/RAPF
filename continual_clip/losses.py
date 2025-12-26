@@ -1,20 +1,9 @@
-﻿"""Loss helpers for ENGINE-style knowledge injection."""
-from __future__ import annotations
-
-from typing import Optional
+﻿from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-from torch import Tensor
-import os
-import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-def engine_contrastive_loss(similarity: torch.Tensor) -> torch.Tensor:
-    targets = torch.arange(similarity.size(0), device=similarity.device)
-    return F.cross_entropy(similarity, targets) 
 
 
 def contrastive_loss(logits: torch.Tensor) -> torch.Tensor:
@@ -44,7 +33,6 @@ class ClipLoss(nn.Module):
         self.labels = {}
 
     def get_ground_truth(self, device, num_logits) -> torch.Tensor:
-        # calculated ground-truth and cache if enabled
         if self.prev_num_logits != num_logits or device not in self.labels:
             labels = torch.arange(num_logits, device=device, dtype=torch.long)
             if self.world_size > 1 and self.local_loss:
@@ -57,24 +45,10 @@ class ClipLoss(nn.Module):
         return labels
 
     def get_logits(self, image_features, text_features, logit_scale):
-        if self.world_size > 1:
-            all_image_features, all_text_features = gather_features(
-                image_features, text_features,
-                self.local_loss, self.gather_with_grad, self.rank, self.world_size, self.use_horovod)
-            image_features = image_features.float()
-            text_features = text_features.float()
-
-            if self.local_loss:
-                logits_per_image = logit_scale * image_features @ all_text_features.T
-                logits_per_text = logit_scale * text_features @ all_image_features.T
-            else:
-                logits_per_image = logit_scale * all_image_features @ all_text_features.T
-                logits_per_text = logits_per_image.T
-        else:
-            image_features = image_features.float()
-            text_features = text_features.float()
-            logits_per_image = logit_scale * image_features @ text_features.T
-            logits_per_text = logit_scale * text_features @ image_features.T
+        image_features = image_features.float()
+        text_features = text_features.float()
+        logits_per_image = logit_scale * image_features @ text_features.T
+        logits_per_text = logit_scale * text_features @ image_features.T
         
         return logits_per_image, logits_per_text
 
