@@ -1,0 +1,83 @@
+﻿hydra:
+  run:
+    dir: ./experiments/${scenario}/${dataset}_${initial_increment}-${increment}_without_exp
+  job:
+    chdir: true
+  job_logging:
+    version: 1
+    formatters:
+      simple:
+        format: '%(message)s'
+
+class_order: ''
+dataset_root: ''
+workdir: ''
+log_path: metric.json
+
+# ==== MODEL CONFIG ====
+model_name: ViT-B-16
+prompt_template: a photo of a {}.
+
+# ==== DATASET ====
+dataset: imagenet_R
+initial_increment: 10
+increment: ${initial_increment}
+scenario: class
+
+# ==== TRAINING ====
+batch_size: 64
+train_batch_size: 64
+epochs: 10
+lr: 0.05
+fp16: false
+seed: 1993
+num_workers: 8
+milestones:
+  - 4
+  - 10
+
+# ==== LOSS / REGULARIZATION ====
+beta: 0.5
+mix_bias: 0.6
+threshold: 0.55
+shrinkage: false
+
+# ==== ENGINE ====
+engine:
+  enable_otf: true
+  enable_otf: true
+  otf_text: true
+  otf_visual: true
+  ptk: true
+  ptk: true
+  alpha: 0.7
+  topk: 5
+  descriptor_json: chat/imagenetr_des.json
+  text_template: a photo of a {}
+  num_prompts_cap: 8
+  lambda_img: 0.5
+  lambda_txt: 2
+  replay_alpha: 0.25
+  sample_num: 0
+  rerank: 0.5
+  stat: 0.8
+  sample_noise: 0.25
+  templates:
+    - a photo of a {}.
+    - a blurry photo of a {}.
+    - a black and white photo of a {}.
+    - a low contrast photo of a {}.
+    - a high contrast photo of a {}.
+    - a bad photo of a {}.
+    - a good photo of a {}.
+    - a photo of a small {}.
+    - a photo of a big {}.
+    - a photo of the {}.
+    - a blurry photo of the {}.
+    - a black and white photo of the {}.
+    - a low contrast photo of the {}.
+    - a high contrast photo of the {}.
+    - a bad photo of the {}.
+    - a good photo of the {}.
+    - a photo of the small {}.
+    - a photo of the big {}.

@@ -1,0 +1,61 @@
+﻿hydra:
+  run:
+    dir: ./experiments/${scenario}/${dataset}_${initial_increment}-${increment}
+  job:
+    chdir: true
+
+  job_logging:
+    version: 1
+    formatters:
+      simple:
+        format: '%(message)s'
+
+class_order: ""
+dataset_root: ""
+workdir: ""
+log_path: "metrics.json"
+model_name: "ViT-B/16"
+prompt_template: "a good photo of a {}."
+
+batch_size: 64
+initial_increment: 40  
+increment: ${initial_increment}
+scenario: "class"
+dataset: "imagenet_R"
+# add conig
+num_workers: 16
+train_batch_size: 64
+epochs: 15
+lr: 0.001
+fp16: false
+seed: 2
+milestones: [4,10]
+beta: 0.5
+mix_bias: 0.7
+threshold: 0.6
+shrinkage: True
+enable_engine_otf: null
+enable_engine_ptk: null
+engine_descriptor_json: "chat/imagenetr_des.json"
+engine_alpha: null
+
+engine:
+  enable_otf: false
+  otf_text: true
+  otf_visual: true
+  ptk: false
+  alpha: 0.7
+  topk: 5
+  descriptor_json: "chat/imagenetr_des.json"
+  text_template: "a photo of a {}, detailed"
+  num_prompts_cap: 8
+  lambda_img: 2.0
+  lambda_txt: 2.0
+  replay_alpha: 0.25
+  sample_num: 0
+  strong_aug:
+    randaugment_n: 2
+    randaugment_m: 9
+    color_jitter: [0.4, 0.4, 0.4, 0.1]
+    random_erasing_p: 0.25
+
