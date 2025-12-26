@@ -15,7 +15,7 @@ import torch.nn.functional as F
 
 from .utils import get_class_ids_per_task, get_class_names
 
-# --- Lớp MLP_Adapter (Không dùng) ---
+
 class MLP_Adapter(nn.Module):
     def __init__(self, c_in, hidden):
         super(MLP_Adapter, self).__init__()
@@ -26,8 +26,7 @@ class MLP_Adapter(nn.Module):
     def forward(self, x):
         x_ = self.fc(x)
         return x_
-    
-# --- LỚP ENGINE_ADAPTER ĐÃ ĐƯỢC CẢI TIẾN ---
+
 class ENGINE_Adapter(nn.Module):
     def __init__(self, c_in, hidden, dropout=0.1, use_layernorm=True, learnable_scale=True):
         super(ENGINE_Adapter, self).__init__()
@@ -251,7 +250,7 @@ class ClassIncrementalCLIP(nn.Module):
             params.append([self.text_fusion_alpha, self.text_fusion_beta])
         return chain.from_iterable(params)
     
-    # ... (Hàm encode_text, encode_image, freeze giữ nguyên) ...
+
     def encode_text(self, text, prompt=False):
         x = self.token_embedding(text).type(self.clip_type)
         x = x + self.positional_embedding.type(self.clip_type)
@@ -320,7 +319,10 @@ class ClassIncrementalCLIP(nn.Module):
             self.text_injection.append(
                 ENGINE_Adapter(512, 256, dropout=dropout_rate).to(self.device).to(dtype=self.dtype)
             )
-    
+        
+        # 2. ÁP DỤNG FUSION (Cập nhật Universal Adapter)
+        if len(self.image_injection) > 1:
+            self.mix_matrix()
 
 
     # ... (Các hàm _flatten, _unflatten giữ nguyên) ...
@@ -342,30 +344,42 @@ class ClassIncrementalCLIP(nn.Module):
                 pointer += num_elements
         return adapter
 
+ 
     def mix_matrix(self):
-            adapters_to_mix_img = self.image_injection
-            if len(adapters_to_mix_img) < 1: 
-                return 
-                
-            all_flat_vectors = []
-            for adapter in adapters_to_mix_img: 
-                all_flat_vectors.append(self._flatten_adapter_params(adapter))
-            v_uni_img = torch.stack(all_flat_vectors).mean(dim=0)
-            self._unflatten_adapter_params(self.uni_image_adapter, v_uni_img)
-            self.freeze(self.uni_image_adapter) 
+        if len(self.image_injection) < 2: 
+            return 
+            
+        num_tasks = len(self.image_injection[:-1])
+        weights = torch.exp(torch.linspace(1 , 0, steps=num_tasks)).to(self.device)
+        
+        # Mix Image Adapters
+        all_flat_vectors = []
+        for adapter in self.image_injection[:-1]: 
+            all_flat_vectors.append(self._flatten_adapter_params(adapter))
+        
 
-            # 3. Fusion Text Adapter
-            adapters_to_mix_txt = self.text_injection
-            if len(adapters_to_mix_txt) < 1:
-                return
-            all_flat_vectors = []
-            for adapter in adapters_to_mix_txt:
-                all_flat_vectors.append(self._flatten_adapter_params(adapter))           
-            v_uni_txt = torch.stack(all_flat_vectors).mean(dim=0)            
-            self._unflatten_adapter_params(self.uni_text_adapter, v_uni_txt)
-            self.freeze(self.uni_text_adapter)
+        stacked_vectors = torch.stack(all_flat_vectors)
+        
+        # Tính trung bình có trọng số: (weights * vectors) / sum(weights)
+        v_uni_img = (stacked_vectors * weights.view(-1, 1)).sum(dim=0) / weights.sum()
+    
+        # Gán cho Universal
+        self._unflatten_adapter_params(self.uni_image_adapter, v_uni_img)
+        self.freeze(self.uni_image_adapter) 
+    
+        # 3. Fusion Text Adapter (Tương tự)
+        all_flat_vectors_txt = []
+        for adapter in self.text_injection[:-1]:
+            all_flat_vectors_txt.append(self._flatten_adapter_params(adapter))
+        
+        stacked_vectors_txt = torch.stack(all_flat_vectors_txt)
+        v_uni_txt = (stacked_vectors_txt * weights.view(-1, 1)).sum(dim=0) / weights.sum()
+        
+        self._unflatten_adapter_params(self.uni_text_adapter, v_uni_txt)
+        self.freeze(self.uni_text_adapter)
 
 
+    # ... (Các hàm apply_image_injection, apply_text_injection giữ nguyên) ...
     def apply_image_injection(self, features: torch.Tensor, is_old=False) -> torch.Tensor:
         if len(self.image_injection) == 0:
             return features
@@ -385,13 +399,16 @@ class ClassIncrementalCLIP(nn.Module):
         alpha = self.image_fusion_alpha.to(device)
         beta = self.image_fusion_beta.to(device)
         
+        age = len(self.image_injection) - 1
+        beta = beta * torch.exp(torch.tensor(-0.1 * age, device=beta.device))
+        
         fusion_weights = torch.stack([alpha, beta], dim=0)
         normalized_weights = F.softmax(fusion_weights, dim=0)
         alpha_hat, beta_hat = normalized_weights[0], normalized_weights[1]
 
         outputs = (alpha_hat * uni_output) + (beta_hat * task_output)
         
-        return outputs
+        return  outputs
 
     def apply_text_injection(self, features: torch.Tensor) -> torch.Tensor:
         if len(self.text_injection) == 0:
@@ -412,13 +429,16 @@ class ClassIncrementalCLIP(nn.Module):
         alpha = self.text_fusion_alpha.to(device)
         beta = self.text_fusion_beta.to(device)
 
+        age = len(self.image_injection) - 1
+        beta = beta * torch.exp(torch.tensor(-0.1 * age, device=beta.device))
+
         fusion_weights = torch.stack([alpha, beta], dim=0)
         normalized_weights = F.softmax(fusion_weights, dim=0)
         alpha_hat, beta_hat = normalized_weights[0], normalized_weights[1]
 
         outputs = (alpha_hat * uni_output) + (beta_hat * task_output)
                     
-        return outputs
+        return  outputs
     
 
     # ... (Các hàm còn lại giữ nguyên) ...
@@ -476,9 +496,9 @@ class ClassIncrementalCLIP(nn.Module):
 
         with torch.no_grad():
             clip_features = self.encode_image(image).float()
-        raw_image_features = clip_features / clip_features.norm(dim=-1, keepdim=True)
-        original_image_features = clip_features.clone()
-        image_features = clip_features
+            raw_image_features = clip_features / clip_features.norm(dim=-1, keepdim=True)
+            original_image_features = clip_features.clone()
+            image_features = clip_features
 
         image_features = self.apply_image_injection(image_features)
         image_features = image_features/image_features.norm(dim=-1, keepdim=True)
@@ -599,7 +619,9 @@ class ClassIncrementalCLIP(nn.Module):
             else:   
                 out.append(f"a photo of {cname}")
         return out
+    
 
+# ... (Phần DomainIncrementalCLIP, TaskAgnosticCLIP, load_model giữ nguyên) ...
 
 class DomainIncrementalCLIP(nn.Module):
     def __init__(self, cfg, device, jit=False) -> None:
