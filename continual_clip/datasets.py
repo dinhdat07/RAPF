@@ -11,14 +11,11 @@ from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 
 
-# FIX: override CUB200 for local dataset (no download)
 def _fix_cub200_for_local():
     from continuum.datasets import cub200
 
-    # Bỏ qua kiểm tra integrity
     cub200.CUB200._check_integrity = lambda self: True
 
-    # Ghi đè hàm get_data()
     def _fixed_get_data(self):
         import numpy as np
         from PIL import Image
@@ -44,8 +41,6 @@ def _fix_cub200_for_local():
 
     cub200.CUB200.get_data = _fixed_get_data
 
-
-# Gọi fix ngay khi load file
 _fix_cub200_for_local()
 
 
@@ -113,11 +108,11 @@ def get_dataset(cfg, is_train, transforms=None):
     return dataset, classes_names
 
 
-def _build_engine_transform(cfg, base_transforms):
+def _build_transform(cfg, base_transforms):
     dataset_name = cfg.dataset.lower() if hasattr(cfg, "dataset") else ""
 
     if dataset_name.startswith("cifar"):
-        print("Using CIFAR-100 ENGINE-style transforms")
+        print("Using CIFAR-100 transforms")
         clip_mean = (0.48145466, 0.4578275, 0.40821073)
         clip_std = (0.26862954, 0.26130258, 0.27577711)
         transform_list = [
@@ -133,7 +128,7 @@ def _build_engine_transform(cfg, base_transforms):
 
 def build_cl_scenarios(cfg, is_train, base_transforms) -> nn.Module:
     dataset, classes_names = get_dataset(cfg, is_train)
-    transforms_to_use = _build_engine_transform(cfg, base_transforms)
+    transforms_to_use = _build_transform(cfg, base_transforms)
 
     if cfg.scenario == "class":
         scenario = ClassIncremental(
