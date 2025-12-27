@@ -482,7 +482,7 @@ class ClassIncrementalCLIP(nn.Module):
         probs = logits_per_image
         if not_ini:
             with torch.no_grad():
-                old_memory_feature = self.apply_image_injection(memory_data, is_old=True)
+                old_memory_feature = self.apply_image_injection(memory_data)
                 old_memory_feature = old_memory_feature / old_memory_feature.norm(dim=1, keepdim=True)
             if edge_sample is not None:
                 return probs, final_image_feas, old_memory_feature, edge_sample_features, img_feas, raw_image_features

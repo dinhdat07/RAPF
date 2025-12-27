@@ -13,7 +13,7 @@ class_order: ''
 dataset_root: ''
 workdir: ''
 log_path: metric.json
-model_name: ViT-B-16
+model_name: ViT-B/16
 
 dataset: imagenet_R
 initial_increment: 10
