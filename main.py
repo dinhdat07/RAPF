@@ -143,14 +143,6 @@ def run_class_incremental(cfg, device):
                 else:
                     loss_hinge = torch.tensor(0.0, device=device)
 
-                if model.lambda_img > 0:
-                    with torch.no_grad():
-                        aug = torch.clamp(inputs + torch.randn_like(inputs) * 0.25, 0, 1)
-                    aug_feas = model.encode_image(aug).float()
-                    aug_feas = aug_feas / aug_feas.norm(dim=-1, keepdim=True)
-                    sim_img = final_image_feas[:aug_feas.shape[0]] @ aug_feas.T
-                    image_aug_loss = contrastive_loss(sim_img)
-
                 labels = [model.total_class_names[int(y)] for y in targets.tolist()]
                 texts_clip=[model.prompt_template.format(inst) for inst in labels]
                 with torch.no_grad():  
@@ -159,24 +151,9 @@ def run_class_incremental(cfg, device):
                 clip_text_feas = model.apply_text_injection(clip_text_feas)
                 clip_text_feas = clip_text_feas /clip_text_feas.norm(dim=-1, keepdim=True)
 
-                if model.lambda_txt > 0:
-                    repeat_ = 1 
-                    anchor_text_loss_list = []
-                    for _ in range(repeat_):
-                        anchor_texts = model._get_text_anchor(labels)
-                        anchor_emb = model.tokenize(anchor_texts).to(model.device)
-                        with torch.no_grad():
-                            anchor_text_features = model.encode_text(anchor_emb)
-                        anchor_text_features = anchor_text_features.float() 
-                        anchor_text_features = anchor_text_features / anchor_text_features.norm(dim=-1, keepdim=True)
-                        anchor_text_loss_list.append(contrastive_loss(clip_text_feas @ anchor_text_features.T))
-                    anchor_text_loss = sum(anchor_text_loss_list) / len(anchor_text_loss_list)
-                else:
-                    anchor_text_loss = 0
-                
                 clip_loss=cliploss(final_image_feas, clip_text_feas, model.logit_scale)
 
-                loss = clip_loss + model.lambda_img * image_aug_loss + model.lambda_txt * anchor_text_loss + loss_hinge
+                loss = clip_loss + loss_hinge
                 
                 loss.backward()
                 optimizer.step()

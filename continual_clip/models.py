@@ -213,9 +213,6 @@ class ClassIncrementalCLIP(nn.Module):
         if self.image_injection and len(self.image_injection) > 0:
             params.append(self.image_injection[-1].parameters())
             params.append([self.image_fusion_alpha, self.image_fusion_beta])
-        if self.text_injection and len(self.text_injection) > 0:
-            params.append(self.text_injection[-1].parameters())
-            params.append([self.text_fusion_alpha, self.text_fusion_beta])
         return chain.from_iterable(params)
     
     def encode_text(self, text):
@@ -275,7 +272,6 @@ class ClassIncrementalCLIP(nn.Module):
                 Bottleneck_Adapter(512, 256, dropout=dropout_rate).to(self.device).to(dtype=self.dtype)
             )
         
-        # 2. ÁP DỤNG FUSION (Cập nhật Universal Adapter)
         if len(self.image_injection) > 1:
             self.mix_matrix()
 
@@ -354,32 +350,7 @@ class ClassIncrementalCLIP(nn.Module):
         return  outputs
 
     def apply_text_injection(self, features):
-        if len(self.text_injection) == 0:
-            return features
-        device = features.device
-        try:
-            target_dtype = next(self.text_injection[0].parameters()).dtype
-        except StopIteration:
-            target_dtype = features.dtype
-            
-        features = features.to(dtype=target_dtype)
-        
-        uni_output = self.uni_text_adapter(features)
-        task_output = self.text_injection[-1](features)
-
-        alpha = self.text_fusion_alpha.to(device)
-        beta = self.text_fusion_beta.to(device)
-
-        age = len(self.image_injection) - 1
-        beta = beta * torch.exp(torch.tensor(-0.1 * age, device=beta.device))
-
-        fusion_weights = torch.stack([alpha, beta], dim=0)
-        normalized_weights = F.softmax(fusion_weights, dim=0)
-        alpha_hat, beta_hat = normalized_weights[0], normalized_weights[1]
-
-        outputs = (alpha_hat * uni_output) + (beta_hat * task_output)
-                    
-        return  outputs
+        return features
     
     
     @torch.no_grad()
@@ -433,9 +404,9 @@ class ClassIncrementalCLIP(nn.Module):
 
         with torch.no_grad():
             clip_features = self.encode_image(image).float()
-            raw_image_features = clip_features / clip_features.norm(dim=-1, keepdim=True)
-            original_image_features = clip_features.clone()
-            image_features = clip_features
+        raw_image_features = clip_features / clip_features.norm(dim=-1, keepdim=True)
+        original_image_features = clip_features.clone()
+        image_features = clip_features
 
         image_features = self.apply_image_injection(image_features)
         image_features = image_features/image_features.norm(dim=-1, keepdim=True)
