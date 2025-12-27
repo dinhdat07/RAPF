@@ -150,29 +150,21 @@ def run_class_incremental(cfg, device):
                     aug_feas = aug_feas / aug_feas.norm(dim=-1, keepdim=True)
                     sim_img = final_image_feas[:aug_feas.shape[0]] @ aug_feas.T
                     image_aug_loss = contrastive_loss(sim_img)
-
-                labels = [model.total_class_names[int(y)] for y in targets.tolist()]
-                texts_clip=[model.prompt_template.format(inst) for inst in labels]
-                with torch.no_grad():  
-                    clip_tokens = model.tokenize(texts_clip).to(model.device)
-                    clip_text_feas = model.encode_text(clip_tokens)
-                clip_text_feas = model.apply_text_injection(clip_text_feas)
-                clip_text_feas = clip_text_feas /clip_text_feas.norm(dim=-1, keepdim=True)
+                else:
+                    image_aug_loss = torch.tensor(0.0, device=device)
 
                 if model.lambda_txt > 0:
-                    repeat_ = 1 
-                    anchor_text_loss_list = []
-                    for _ in range(repeat_):
-                        anchor_texts = model._get_text_anchor(model.new_des_dict, labels)
-                        anchor_emb = model.tokenize(anchor_texts).to(model.device)
-                        with torch.no_grad():
-                            anchor_text_features = model.encode_text(anchor_emb)
-                        anchor_text_features = anchor_text_features.float() 
+                    with torch.no_grad():
+                        anchor_text_features = model.class_name_features[targets].float()
                         anchor_text_features = anchor_text_features / anchor_text_features.norm(dim=-1, keepdim=True)
-                        anchor_text_loss_list.append(contrastive_loss(clip_text_feas @ anchor_text_features.T))
-                    anchor_text_loss = sum(anchor_text_loss_list) / len(anchor_text_loss_list)
+
+                    clip_text_feas = model.apply_text_injection(anchor_text_features)
+                    clip_text_feas = clip_text_feas / clip_text_feas.norm(dim=-1, keepdim=True)
+
+                    anchor_text_loss = contrastive_loss(clip_text_feas @ anchor_text_features.T)
                 else:
-                    anchor_text_loss = 0
+                    anchor_text_loss = torch.tensor(0.0, device=device)
+
                 
                 clip_loss=cliploss(final_image_feas, clip_text_feas, model.logit_scale)
 

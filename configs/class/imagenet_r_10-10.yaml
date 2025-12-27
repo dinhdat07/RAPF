@@ -14,7 +14,7 @@ dataset_root: ''
 workdir: ''
 log_path: metric.json
 model_name: ViT-B-16
-prompt_template: a photo of a {}.
+
 dataset: imagenet_R
 initial_increment: 10
 increment: ${initial_increment}

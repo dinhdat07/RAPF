@@ -406,6 +406,7 @@ class ClassIncrementalCLIP(nn.Module):
         all_prompts = []
         for cname in self.total_class_names:
             all_prompts.extend([tmpl.format(cname) for tmpl in prompt_templates])
+
         self.text_tokens = self.tokenize(all_prompts).to(self.device)
         self.text_end = self.text_tokens.max(dim=-1)[1]
         self.class_name_features = self.get_class_name_features()
@@ -512,13 +513,6 @@ class ClassIncrementalCLIP(nn.Module):
             self.class_edge_distance.append((max_distance.mean() - max_distance.min(), max_distance.max() - max_distance.mean(), max_distance.mean()))
             self.class_mean_list.append(mean)
             self.class_cov_list.append(cov)
-
-    def _get_text_anchor(self, classnames: Iterable[str]) -> List[str]:
-        out: List[str] = []
-        for cname in classnames:
-            out.append(f"a photo of {cname}")
-        return out
-    
 
 class DomainIncrementalCLIP(nn.Module):
     def __init__(self, cfg, device, jit=False) -> None:
