@@ -101,6 +101,7 @@ class ClassIncrementalCLIP(nn.Module):
         for param in model.parameters():
             param.requires_grad = False
             
+        self.prompt_template = cfg.prompt_template
         self.visual = model.visual
         self.transformer = model.transformer
         self.positional_embedding = model.positional_embedding
