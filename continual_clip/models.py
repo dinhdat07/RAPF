@@ -272,7 +272,7 @@ class ClassIncrementalCLIP(nn.Module):
             )
 
     def apply_image_injection(self, features):
-        if len(self.image_injection) == 0:
+        if not self.cfg.img_injection or len(self.image_injection) == 0:
             return features
         try:
             target_dtype = next(self.image_injection[0].parameters()).dtype
@@ -283,7 +283,7 @@ class ClassIncrementalCLIP(nn.Module):
         return task_output
 
     def apply_text_injection(self, features):
-        if len(self.text_injection) == 0:
+        if not self.cfg.txt_injection or len(self.text_injection) == 0:
             return features
         try:
             target_dtype = next(self.text_injection[0].parameters()).dtype

@@ -45,3 +45,8 @@ templates:
   - a {} in a video game.
   - art of the {}.
   - a photo of the small {}.
+
+lambda_hinge: 1
+gda: True
+img_injection: True
+txt_injection: True

@@ -174,11 +174,11 @@ def run_class_incremental(cfg, device):
                         anchor_text_loss_list.append(contrastive_loss(clip_text_feas @ anchor_text_features.T))
                     anchor_text_loss = sum(anchor_text_loss_list) / len(anchor_text_loss_list)
                 else:
-                    anchor_text_loss = 0
+                    anchor_text_loss = torch.tensor(0.0, device=device)
                 
                 clip_loss=cliploss(final_image_feas, clip_text_feas, model.logit_scale)
 
-                loss = clip_loss + model.lambda_img * image_aug_loss + model.lambda_txt * anchor_text_loss + loss_hinge
+                loss = clip_loss + model.lambda_img * image_aug_loss + model.lambda_txt * anchor_text_loss + cfg.lambda_hinge * loss_hinge
                 
                 loss.backward()
                 optimizer.step()
@@ -220,12 +220,13 @@ def run_class_incremental(cfg, device):
             inputs, targets = inputs.to(device), targets.to(device)
             with torch.no_grad():
                 outputs, _, __, ___, _pre_image_feas, raw_image_feas = model(inputs)
-                outputs = gda_output(
-                    model=model,
-                    cfg=cfg,
-                    outputs=outputs,
-                    raw_image_feas=raw_image_feas,
-                )
+                if cfg.gda:
+                    outputs = gda_output(
+                        model=model,
+                        cfg=cfg,
+                        outputs=outputs,
+                        raw_image_feas=raw_image_feas,
+                    )
                 torch.nn.functional.softmax(outputs, dim=-1)
             metric_logger.add([outputs.cpu().argmax(dim=1), targets.cpu(), task_ids], subset="test")
 
