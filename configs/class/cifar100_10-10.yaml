@@ -16,7 +16,7 @@ model_name: ViT-B/16
 prompt_template: a photo of a {}.
 
 batch_size: 64
-initial_increment: 5
+initial_increment: 10
 increment: ${initial_increment}
 scenario: class
 dataset: cifar100

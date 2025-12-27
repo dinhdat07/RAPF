@@ -150,6 +150,8 @@ def run_class_incremental(cfg, device):
                     aug_feas = aug_feas / aug_feas.norm(dim=-1, keepdim=True)
                     sim_img = final_image_feas[:aug_feas.shape[0]] @ aug_feas.T
                     image_aug_loss = contrastive_loss(sim_img)
+                else:
+                    image_aug_loss = torch.tensor(0.0, device=device)
 
                 labels = [model.total_class_names[int(y)] for y in targets.tolist()]
                 texts_clip=[model.prompt_template.format(inst) for inst in labels]
@@ -172,7 +174,7 @@ def run_class_incremental(cfg, device):
                         anchor_text_loss_list.append(contrastive_loss(clip_text_feas @ anchor_text_features.T))
                     anchor_text_loss = sum(anchor_text_loss_list) / len(anchor_text_loss_list)
                 else:
-                    anchor_text_loss = 0
+                    anchor_text_loss = torch.tensor(0.0, device=device)
                 
                 clip_loss=cliploss(final_image_feas, clip_text_feas, model.logit_scale)
 
