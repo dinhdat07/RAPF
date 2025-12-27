@@ -15,7 +15,7 @@ dataset: "cub200"
 workdir: ""
 log_path: "metric.json"
 model_name: "ViT-B/16"
-prompt_template: "a photo of a {} bird"
+prompt_template: "a good photo of a {}."
 
 batch_size: 64
 train_batch_size: 64
@@ -40,7 +40,4 @@ sample_num: 0
 stat: 0.95
 sample_noise: 0.3
 templates:
-  - a photo of a {} bird.
-  - a photo of the {} bird.
-  - a close-up photo of a {} bird.
-  - a close-up photo of the {} bird.
+  - a photo of a {}, a type of bird.

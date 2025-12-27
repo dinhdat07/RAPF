@@ -42,23 +42,10 @@ sample_num: 0
 stat: 0.9
 sample_noise: 0.25
 templates:
-  - a painting of a {}.
-  - a drawing of a {}.
-  - a sketch of a {}.
-  - a cartoon of a {}.
-  - a graffiti of a {}.
-  - a tattoo of a {}.
-  - an illustration of a {}.
-  - a digital art of a {}.
-  - a 3D render of a {}.
-  - a low poly render of a {}.
-  - a pixel art of a {}.
-  - a vector art of a {}.
-  - a watercolor painting of a {}.
-  - an oil painting of a {}.
-  - a cubist painting of a {}.
-  - a surreal painting of a {}.
-  - a pop art of a {}.
-  - a comic book drawing of a {}.
-  - a children's book illustration of a {}.
-  - a stylized art of a {}.
+  - itap of a {}.
+  - a bad photo of the {}.
+  - a origami {}.
+  - a photo of the large {}.
+  - a {} in a video game.
+  - art of the {}..
+  - a photo of the small {}.
