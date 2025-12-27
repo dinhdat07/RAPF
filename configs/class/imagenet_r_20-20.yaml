@@ -13,19 +13,12 @@ class_order: ""
 dataset_root: "/kaggle/input/imagenet-r"
 workdir: ""
 log_path: "metric.json"
-
-# ==== MODEL ====
 model_name: "ViT-B-16"
 prompt_template: "a good photo of a {}."
-
-# ==== DATASET ====
 dataset: "imagenet_R"
-dataname: "cifar224"
 initial_increment: 20
 increment: ${initial_increment}
 scenario: "class"
-
-# ==== TRAINING ====
 batch_size: 64
 train_batch_size: 64
 epochs: 10
@@ -33,39 +26,35 @@ lr: 0.01
 fp16: false
 seed: 1993
 num_workers: 16
-milestones:
-  - 4
-  - 10
-
-# ==== LOSS / REGULARIZATION ====
 beta: 1
 mix_bias: 0.7
 threshold: 0.65
 shrinkage: True
-
-# ==== ENGINE (Continual Learning) ====
-engine:
-  enable_otf: true
-  otf_text: true
-  otf_visual: true
-  ptk: true
-  alpha: 0.7
-  topk: 5
-  descriptor_json: "chat/imagenetr_des.json"
-  text_template: "a photo of a {}"
-  num_prompts_cap: 8
-  lambda_img: 2.0
-  lambda_txt: 2.0
-  replay_alpha: 0.25
-  sample_num: 0
-  rerank: 0
-  stat: 0.9
-  sample_noise: 0.25
-  templates:
-    - itap of a {}.
-    - a bad photo of the {}.
-    - a origami {}.
-    - a photo of the large {}.
-    - a {} in a video game.
-    - art of the {}..
-    - a photo of the small {}.
+dropout: 0.1
+lambda_img: 2.0
+lambda_txt: 2.0
+replay_alpha: 0.25
+sample_num: 0
+stat: 0.9
+sample_noise: 0.25
+templates:
+  - a painting of a {}.
+  - a drawing of a {}.
+  - a sketch of a {}.
+  - a cartoon of a {}.
+  - a graffiti of a {}.
+  - a tattoo of a {}.
+  - an illustration of a {}.
+  - a digital art of a {}.
+  - a 3D render of a {}.
+  - a low poly render of a {}.
+  - a pixel art of a {}.
+  - a vector art of a {}.
+  - a watercolor painting of a {}.
+  - an oil painting of a {}.
+  - a cubist painting of a {}.
+  - a surreal painting of a {}.
+  - a pop art of a {}.
+  - a comic book drawing of a {}.
+  - a children's book illustration of a {}.
+  - a stylized art of a {}.

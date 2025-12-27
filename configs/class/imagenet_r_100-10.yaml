@@ -24,37 +24,40 @@ scenario: "class"
 dataset: "imagenet_R"
 num_workers: 16
 train_batch_size: 64
-epochs: 15
-lr: 0.001
+epochs: 10
+lr: 0.01
 fp16: false
-seed: 2
-milestones: [4,10]
+seed: 1993
 beta: 2 
 mix_bias: 0.7
 threshold: 0.65
 shrinkage: True
-enable_engine_otf: null
-enable_engine_ptk: null
-engine_descriptor_json: "chat/imagenetr_des.json"
-engine_alpha: null
 
-engine:
-  enable_otf: false
-  otf_text: true
-  otf_visual: true
-  ptk: false
-  alpha: 0.7
-  topk: 5
-  descriptor_json: "chat/imagenetr_des.json"
-  text_template: "a photo of a {}, detailed"
-  num_prompts_cap: 8
-  lambda_img: 2.0
-  lambda_txt: 2.0
-  replay_alpha: 0.25
-  sample_num: 0
-  strong_aug:
-    randaugment_n: 2
-    randaugment_m: 9
-    color_jitter: [0.4, 0.4, 0.4, 0.1]
-    random_erasing_p: 0.25
-
+dropout: 0.1
+lambda_img: 2.0
+lambda_txt: 2.0
+replay_alpha: 0.25
+sample_num: 0
+stat: 0.9
+sample_noise: 0.25
+templates:
+  - a painting of a {}.
+  - a drawing of a {}.
+  - a sketch of a {}.
+  - a cartoon of a {}.
+  - a graffiti of a {}.
+  - a tattoo of a {}.
+  - an illustration of a {}.
+  - a digital art of a {}.
+  - a 3D render of a {}.
+  - a low poly render of a {}.
+  - a pixel art of a {}.
+  - a vector art of a {}.
+  - a watercolor painting of a {}.
+  - an oil painting of a {}.
+  - a cubist painting of a {}.
+  - a surreal painting of a {}.
+  - a pop art of a {}.
+  - a comic book drawing of a {}.
+  - a children's book illustration of a {}.
+  - a stylized art of a {}.

@@ -93,7 +93,6 @@ class ClassIncrementalCLIP(nn.Module):
     def __init__(self, cfg, device, jit=False):
         super().__init__()
         self.cfg = cfg
-        self.prompt_template = cfg.prompt_template
         self.device = device
         self.classes_names = None
 
@@ -119,7 +118,7 @@ class ClassIncrementalCLIP(nn.Module):
         self.clip_type = model.dtype
         self.tokenize = clip.tokenize
 
-        dropout_rate = float(getattr(cfg, 'dropout', 0.1))
+        dropout_rate = self.cfg.dropout
         self.uni_image_adapter = Bottleneck_Adapter(512, 256, dropout=dropout_rate).to(self.device).to(dtype=self.dtype)
         self.uni_text_adapter = Bottleneck_Adapter(512, 256, dropout=dropout_rate).to(self.device).to(dtype=self.dtype)
         self.freeze(self.uni_image_adapter)
@@ -131,11 +130,11 @@ class ClassIncrementalCLIP(nn.Module):
         self.text_fusion_alpha = nn.Parameter(torch.ones(1))
         self.text_fusion_beta = nn.Parameter(torch.ones(1))
 
-        self.lambda_img = self.config.lambda_img
-        self.lambda_txt = self.config.lambda_txt
-        self.replay_alpha = self.config.replay_alpha
-        self.replay_sample_num = self.config.sample_num
-        self.sample_noise = self.config.sample_noise
+        self.lambda_img = self.cfg.lambda_img
+        self.lambda_txt = self.cfg.lambda_txt
+        self.replay_alpha = self.cfg.replay_alpha
+        self.replay_sample_num = self.cfg.sample_num
+        self.sample_noise = self.cfg.sample_noise
 
         self.image_injection = nn.ModuleList()
         self.text_injection = nn.ModuleList()
@@ -243,7 +242,7 @@ class ClassIncrementalCLIP(nn.Module):
         for inj in self.text_injection:
             self.freeze(inj)
 
-        dropout_rate = float(getattr(self.cfg, 'dropout', 0.1))
+        dropout_rate = self.cfg.dropout
         if self.image_injection:
             new_image_adapter = copy.deepcopy(self.image_injection[-1])
             for param in new_image_adapter.parameters():
@@ -397,10 +396,8 @@ class ClassIncrementalCLIP(nn.Module):
         self.known_classes = len(self.total_class_names)
         self.total_class_names += get_class_names(self.classes_names, self.class_ids_per_task[task_id])
         self.current_class_names = get_class_names(self.classes_names, self.class_ids_per_task[task_id])
-        if self.cfg.templates:
-            prompt_templates = self.cfg.templates
-        else:
-            prompt_templates = [self.prompt_template]
+        prompt_templates = self.cfg.templates
+        
         self.templates_per_class = len(prompt_templates)
         all_prompts = []
         for cname in self.total_class_names:
