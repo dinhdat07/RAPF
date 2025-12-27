@@ -163,7 +163,7 @@ def run_class_incremental(cfg, device):
                     repeat_ = 1 
                     anchor_text_loss_list = []
                     for _ in range(repeat_):
-                        anchor_texts = model._get_text_anchor(model.new_des_dict, labels)
+                        anchor_texts = model._get_text_anchor(labels)
                         anchor_emb = model.tokenize(anchor_texts).to(model.device)
                         with torch.no_grad():
                             anchor_text_features = model.encode_text(anchor_emb)
