@@ -273,7 +273,10 @@ class ClassIncrementalCLIP(nn.Module):
             self.text_injection.append(
                 Bottleneck_Adapter(512, 256, dropout=dropout_rate).to(self.device).to(dtype=self.dtype)
             )
-    
+        
+        # 2. ÁP DỤNG FUSION (Cập nhật Universal Adapter)
+        if len(self.image_injection) > 1:
+            self.mix_matrix()
 
 
     def _flatten_adapter_params(self, adapter):
@@ -294,6 +297,7 @@ class ClassIncrementalCLIP(nn.Module):
                 pointer += num_elements
         return adapter
 
+ 
     def mix_matrix(self):
         if len(self.image_injection) < 2: 
             return 
@@ -428,9 +432,9 @@ class ClassIncrementalCLIP(nn.Module):
 
         with torch.no_grad():
             clip_features = self.encode_image(image).float()
-        raw_image_features = clip_features / clip_features.norm(dim=-1, keepdim=True)
-        original_image_features = clip_features.clone()
-        image_features = clip_features
+            raw_image_features = clip_features / clip_features.norm(dim=-1, keepdim=True)
+            original_image_features = clip_features.clone()
+            image_features = clip_features
 
         image_features = self.apply_image_injection(image_features)
         image_features = image_features/image_features.norm(dim=-1, keepdim=True)
@@ -514,6 +518,7 @@ class ClassIncrementalCLIP(nn.Module):
         for cname in classnames:
             out.append(f"a photo of {cname}")
         return out
+    
 
 class DomainIncrementalCLIP(nn.Module):
     def __init__(self, cfg, device, jit=False) -> None:
