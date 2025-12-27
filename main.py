@@ -205,12 +205,6 @@ def run_class_incremental(cfg, device):
             inputs, targets = inputs.to(device), targets.to(device)
             with torch.no_grad():
                 outputs, _, __, ___, _pre_image_feas, raw_image_feas = model(inputs)
-                outputs = gda_output(
-                    model=model,
-                    cfg=cfg,
-                    outputs=outputs,
-                    raw_image_feas=raw_image_feas,
-                )
                 torch.nn.functional.softmax(outputs, dim=-1)
             metric_logger.add([outputs.cpu().argmax(dim=1), targets.cpu(), task_ids], subset="test")
 
