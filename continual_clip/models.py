@@ -211,10 +211,8 @@ class ClassIncrementalCLIP(nn.Module):
         params = []
         if self.image_injection and len(self.image_injection) > 0:
             params.append(self.image_injection[-1].parameters())
-            params.append([self.image_fusion_alpha, self.image_fusion_beta])
         if self.text_injection and len(self.text_injection) > 0:
             params.append(self.text_injection[-1].parameters())
-            params.append([self.text_fusion_alpha, self.text_fusion_beta])
         return chain.from_iterable(params)
     
     def encode_text(self, text):
@@ -272,112 +270,29 @@ class ClassIncrementalCLIP(nn.Module):
             self.text_injection.append(
                 MLP_Adapter(512, 512).to(self.device).to(dtype=self.dtype)
             )
-        
-        # 2. ÁP DỤNG FUSION (Cập nhật Universal Adapter)
-        if len(self.image_injection) > 1:
-            self.mix_matrix()
-
-
-    def _flatten_adapter_params(self, adapter):
-        params = []
-        for name, param in adapter.named_parameters():
-            if isinstance(param, nn.Parameter):
-                params.append(param.data.flatten())
-        return torch.cat(params)
-
-    def _unflatten_adapter_params(self, adapter, flat_vector):
-        pointer = 0
-        for name, param in adapter.named_parameters():
-            if isinstance(param, nn.Parameter):
-                num_elements = param.numel()
-                param.data.copy_(
-                    flat_vector[pointer:pointer + num_elements].view_as(param.data)
-                )
-                pointer += num_elements
-        return adapter
-
- 
-    def mix_matrix(self):
-        if len(self.image_injection) < 2: 
-            return 
-            
-        num_tasks = len(self.image_injection[:-1])
-        weights = torch.exp(torch.linspace(1 , 0, steps=num_tasks)).to(self.device)
-        
-        all_flat_vectors = []
-        for adapter in self.image_injection[:-1]: 
-            all_flat_vectors.append(self._flatten_adapter_params(adapter))
-        
-        stacked_vectors = torch.stack(all_flat_vectors)
-        v_uni_img = (stacked_vectors * weights.view(-1, 1)).sum(dim=0) / weights.sum()
-        self._unflatten_adapter_params(self.uni_image_adapter, v_uni_img)
-        self.freeze(self.uni_image_adapter) 
-    
-        all_flat_vectors_txt = []
-        for adapter in self.text_injection[:-1]:
-            all_flat_vectors_txt.append(self._flatten_adapter_params(adapter))
-        
-        stacked_vectors_txt = torch.stack(all_flat_vectors_txt)
-        v_uni_txt = (stacked_vectors_txt * weights.view(-1, 1)).sum(dim=0) / weights.sum()
-        
-        self._unflatten_adapter_params(self.uni_text_adapter, v_uni_txt)
-        self.freeze(self.uni_text_adapter)
-
 
     def apply_image_injection(self, features):
         if len(self.image_injection) == 0:
             return features
-        device = features.device 
         try:
             target_dtype = next(self.image_injection[0].parameters()).dtype
         except StopIteration:
             target_dtype = features.dtype
         features = features.to(dtype=target_dtype)
-        
-        uni_output = self.uni_image_adapter(features)
         task_output = self.image_injection[-1](features)
-
-        alpha = self.image_fusion_alpha.to(device)
-        beta = self.image_fusion_beta.to(device)
-        
-        age = len(self.image_injection) - 1
-        beta = beta * torch.exp(torch.tensor(-0.1 * age, device=beta.device))
-        
-        fusion_weights = torch.stack([alpha, beta], dim=0)
-        normalized_weights = F.softmax(fusion_weights, dim=0)
-        alpha_hat, beta_hat = normalized_weights[0], normalized_weights[1]
-
-        outputs = (alpha_hat * uni_output) + (beta_hat * task_output)
-        
-        return  outputs
+        return task_output
 
     def apply_text_injection(self, features):
         if len(self.text_injection) == 0:
             return features
-        device = features.device
         try:
             target_dtype = next(self.text_injection[0].parameters()).dtype
         except StopIteration:
             target_dtype = features.dtype
             
         features = features.to(dtype=target_dtype)
-        
-        uni_output = self.uni_text_adapter(features)
         task_output = self.text_injection[-1](features)
-
-        alpha = self.text_fusion_alpha.to(device)
-        beta = self.text_fusion_beta.to(device)
-
-        age = len(self.image_injection) - 1
-        beta = beta * torch.exp(torch.tensor(-0.1 * age, device=beta.device))
-
-        fusion_weights = torch.stack([alpha, beta], dim=0)
-        normalized_weights = F.softmax(fusion_weights, dim=0)
-        alpha_hat, beta_hat = normalized_weights[0], normalized_weights[1]
-
-        outputs = (alpha_hat * uni_output) + (beta_hat * task_output)
-                    
-        return  outputs
+        return task_output
     
     
     @torch.no_grad()
