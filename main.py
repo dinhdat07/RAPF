@@ -143,6 +143,16 @@ def run_class_incremental(cfg, device):
                 else:
                     loss_hinge = torch.tensor(0.0, device=device)
 
+                if model.lambda_img > 0:
+                    with torch.no_grad():
+                        aug = torch.clamp(inputs + torch.randn_like(inputs) * 0.25, 0, 1)
+                    aug_feas = model.encode_image(aug).float()
+                    aug_feas = aug_feas / aug_feas.norm(dim=-1, keepdim=True)
+                    sim_img = final_image_feas[:aug_feas.shape[0]] @ aug_feas.T
+                    image_aug_loss = contrastive_loss(sim_img)
+                else:
+                    image_aug_loss = torch.tensor(0.0, device=device)
+
                 labels = [model.total_class_names[int(y)] for y in targets.tolist()]
                 texts_clip=[model.prompt_template.format(inst) for inst in labels]
                 with torch.no_grad():  
@@ -150,10 +160,10 @@ def run_class_incremental(cfg, device):
                     clip_text_feas = model.encode_text(clip_tokens)
                 clip_text_feas = model.apply_text_injection(clip_text_feas)
                 clip_text_feas = clip_text_feas /clip_text_feas.norm(dim=-1, keepdim=True)
-
+                
                 clip_loss=cliploss(final_image_feas, clip_text_feas, model.logit_scale)
 
-                loss = clip_loss + loss_hinge
+                loss = clip_loss + loss_hinge + model.lambda_txt * image_aug_loss
                 
                 loss.backward()
                 optimizer.step()
