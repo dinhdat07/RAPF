@@ -119,9 +119,8 @@ class ClassIncrementalCLIP(nn.Module):
         self.clip_type = model.dtype
         self.tokenize = clip.tokenize
 
-        dropout_rate = self.cfg.dropout
-        self.uni_image_adapter = Bottleneck_Adapter(512, 256, dropout=dropout_rate).to(self.device).to(dtype=self.dtype)
-        self.uni_text_adapter = Bottleneck_Adapter(512, 256, dropout=dropout_rate).to(self.device).to(dtype=self.dtype)
+        self.uni_image_adapter = MLP_Adapter(512, 512).to(self.device).to(dtype=self.dtype)
+        self.uni_text_adapter = MLP_Adapter(512, 512).to(self.device).to(dtype=self.dtype)
         self.freeze(self.uni_image_adapter)
         self.freeze(self.uni_text_adapter)
 
@@ -243,7 +242,6 @@ class ClassIncrementalCLIP(nn.Module):
         for inj in self.text_injection:
             self.freeze(inj)
 
-        dropout_rate = self.cfg.dropout
         if self.image_injection:
             new_image_adapter = copy.deepcopy(self.image_injection[-1])
             for param in new_image_adapter.parameters():
@@ -256,7 +254,7 @@ class ClassIncrementalCLIP(nn.Module):
             self.image_injection.append(new_image_adapter.to(self.device).to(dtype=self.dtype))
         else:
             self.image_injection.append(
-                Bottleneck_Adapter(512, 256, dropout=dropout_rate).to(self.device).to(dtype=self.dtype)
+                MLP_Adapter(512, 512).to(self.device).to(dtype=self.dtype)
             )
 
         if self.text_injection:
@@ -272,7 +270,7 @@ class ClassIncrementalCLIP(nn.Module):
             self.text_injection.append(new_text_adapter.to(self.device).to(dtype=self.dtype))
         else:
             self.text_injection.append(
-                Bottleneck_Adapter(512, 256, dropout=dropout_rate).to(self.device).to(dtype=self.dtype)
+                MLP_Adapter(512, 512).to(self.device).to(dtype=self.dtype)
             )
         
         # 2. ÁP DỤNG FUSION (Cập nhật Universal Adapter)
