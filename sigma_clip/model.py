@@ -8,15 +8,15 @@ import torch.nn as nn
 from omegaconf import DictConfig
 
 from .utils import get_class_ids_per_task, get_class_names
-
-
+    
 class LinearAdapter(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int):
-        super().__init__()
-        self.proj = nn.Linear(in_dim, out_dim)
+    def __init__(self, c_in, hidden):
+        super(LinearAdapter, self).__init__()
+        self.fc = nn.Sequential(nn.Linear(c_in, hidden))
 
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        return self.proj(features)
+    def forward(self, x):
+        x_ = self.fc(x)
+        return x_
 
 
 def shrink_cov(cov: torch.Tensor) -> torch.Tensor:
@@ -88,7 +88,7 @@ class SigmaClassIncrementalCLIP(nn.Module):
         self.W = None
         self.b = None
 
-    def init_adapter(self) -> None:
+    def init_adapter(self):
         self.image_adapter = LinearAdapter(512, 512).to(self.device).to(dtype=self.dtype)
         self.text_adapter = LinearAdapter(512, 512).to(self.device).to(dtype=self.dtype)
 
