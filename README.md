@@ -1,87 +1,150 @@
-# Class-Incremental Learning with CLIP: Adaptive Representation Adjustment and Parameter Fusion (ECCV24)
-This is the official code for our paper: <a href='https://arxiv.org/pdf/2407.14143'><img src='https://img.shields.io/badge/Paper-Arxiv-red'></a>
+﻿# SIGMA-CLIP: Statistical Inference with Gaussian Memory Anchors
 
-## Getting Started
+Implementation for **"Statistical Memory Head for Class-Incremental Vision-Language Learning with CLIP" (ICME 2026 submission)**, with method naming updated to **SIGMA**.
 
-## Environment
-create enviroment using Miniconda (or Anaconda)
+This repository trains frozen CLIP with lightweight adapters and performs inference-time calibration with SIGMA using class-wise Gaussian statistics in the frozen CLIP feature space.
+
+## Method Overview
+
+The pipeline has two components:
+
+1. **Adapter-based incremental training**
+- Frozen CLIP image/text encoders.
+- Task-wise image/text bottleneck adapters.
+- Adapter fusion across tasks.
+- Auxiliary losses:
+  - CLIP contrastive loss,
+  - image augmentation consistency,
+  - text anchor regularization,
+  - hard-pair hinge separation.
+
+2. **Inference-time SIGMA calibration**
+- Per-class mean/covariance estimated from frozen CLIP image features.
+- Shared precision update across tasks.
+- LDA-style statistical logits fused with adapter discriminative logits.
+
+## Repository Structure
+
+- `sigma_clip/`: SIGMA-centric implementation.
+  - `cli.py`: Hydra entrypoint.
+  - `trainer.py`: class-incremental train/eval loop.
+  - `model.py`: CLIP + adapters + replay + statistics logic.
+  - `data.py`: dataset/scenario construction.
+  - `config.py`: runtime config normalization (flat + `engine.*` compatible).
+  - `utils.py`: class orders, workdir helpers, SIGMA logit fusion.
+  - `losses.py`: CLIP/contrastive loss helpers.
+- `main.py`: thin Hydra entry wrapper to `sigma_clip.cli`.
+- `configs/class/`: experiment configs.
+- `class_orders/`: class order definitions.
+- `metadata/class_names/`: dataset class-name files used for prompt construction.
+
+## Installation
+
+### 1. Environment
+
+```bash
+conda create -n sigma_clip python=3.8
+conda activate sigma_clip
 ```
-conda create -n continual_clip python=3.8
-conda activate continual_clip
-```
-install dependencies:
+
+### 2. Dependencies
+
 ```bash
 bash setup_environment.sh
-``` 
-### Running scripts
-
-We provide the scripts for imagenet100. Please run:
-
 ```
+
+This installs PyTorch (CUDA 11.1 build), Python requirements, and OpenAI CLIP.
+
+## Dataset Preparation
+
+### CIFAR-100
+- Downloaded automatically by Continuum when running.
+- Set `dataset_root` to a writable folder.
+
+### ImageNet-R
+Expected layout:
+
+```text
+imagenet-r/
+├── train/
+│   ├── class_a/
+│   └── ...
+└── test/
+    ├── class_a/
+    └── ...
+```
+
+Class order file: `class_orders/imagenet_R_order.yaml`.
+Class names file: `metadata/class_names/imagenet_R_classes.txt`.
+
+## Training
+
+All runs use Hydra via `main.py`.
+
+### CIFAR-100 (example)
+
+```bash
 python main.py \
-    --config-path configs/class \
-    --config-name imagenet100_10-10.yaml \
-    dataset_root="[imagenet1k_path]" \
-    class_order="class_orders/imagenet100.yaml"
-```
-The dataset_root folder should contain the train and val folders.
-```
-imagenet1k_path
-├── train
-│   ├── n01440764 
-│   └── ···
-├── val
-│   ├── n01440764 
-│   └── ···
-
-imagenet-r_path
-├── train
-│   ├── n01443537 
-│   └── ···
-├── val
-│   ├── n01443537 
-│   └── ···
-
+  --config-path configs/class \
+  --config-name cifar100_10-10.yaml \
+  dataset_root="/path/to/cifar_root" \
+  class_order="class_orders/cifar100_order.yaml"
 ```
 
-The command to run the other two datasets is similar, in run_experiment.sh
+### ImageNet-R (example)
 
-### datasets
-Cifar100 will download automatically.
-Imagenet-R is randomly splited. You can also use our splited list in RAPF/imgr_split/imgr_train_test_split.txt.
+```bash
+python main.py \
+  --config-path configs/class \
+  --config-name imagenet_r_20-20.yaml \
+  dataset_root="/path/to/imagenet-r" \
+  class_order="class_orders/imagenet_R_order.yaml"
+```
 
-The format of imgr_train_test_split.txt:
-```
-train
-n02051845/art_0.jpg
-...
-test
-n02051845/tattoo_4.jpg
-...
-```
+## Evaluation and Outputs
+
+Evaluation runs after each incremental task during training.
+
+Main output file:
+- `metric.json` (or configured `log_path`) with per-task and final records.
+
+Per-task record fields:
+- `task`, `train_acc`, `test_acc`, `avg_acc`, `forgetting`, `acc_per_task`, `bwt`, `fwt`
+
+Final record fields:
+- `last`, `avg`
+
+Hydra also saves resolved config to `config.yaml` in the run directory.
+
+## Key Configs
+
+Core keys (top-level):
+- `dataset`, `dataset_root`, `class_order`
+- `initial_increment`, `increment`
+- `train_batch_size`, `batch_size`, `epochs`, `lr`, `seed`
+- `threshold`, `beta`, `shrinkage`
+
+SIGMA/adaptation keys (supported in both styles):
+- Flat style: `lambda_img`, `lambda_txt`, `sample_num`, `sample_noise`, `stat`, `templates`, `dropout`
+- Nested style: `engine.lambda_img`, `engine.lambda_txt`, `engine.sample_num`, `engine.sample_noise`, `engine.stat`, `engine.templates`, `engine.dropout`
+
+Runtime normalization resolves both to one behavior-preserving config.
+
+## Reproducibility Notes
+
+- Global seeds are fixed for Python/NumPy/PyTorch.
+- CLIP backbone is frozen; only adapter/fusion-related parameters are trainable per task.
+- For strict before/after comparisons, use identical:
+  - config,
+  - class order,
+  - seed,
+  - dataset root/splits,
+  - CUDA environment.
 
 ## Acknowledgement
-Our method implementation is based on the [Continual-CLIP](https://github.com/vgthengane/Continual-CLIP).
 
-## Citation
-
-If you find our repo useful for your research, please consider citing our paper:
-
-```bibtex
-@inproceedings{huang2024class,
-  title={Class-incremental learning with clip: Adaptive representation adjustment and parameter fusion},
-  author={Huang, Linlan and Cao, Xusheng and Lu, Haori and Liu, Xialei},
-  booktitle={European Conference on Computer Vision},
-  pages={214--231},
-  year={2024},
-  organization={Springer}
-}
-```
+This implementation was originally built on top of prior continual CLIP codebases and then refactored to the SIGMA method structure.
 
 ## License
-This code is licensed under the [Creative Commons Attribution-NonCommercial 4.0 International](https://creativecommons.org/licenses/by-nc/4.0/) for non-commercial use only.
-Please note that any commercial use of this code requires formal permission prior to use.
 
-## Contact
-
-For technical questions, please contact <a href="huanglinlan@mail.nankai.edu.cn">huanglinlan@mail.nankai.edu.cn</a> 
+Same as repository license terms.

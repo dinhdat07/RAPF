@@ -1,10 +1,4 @@
-#!bin/bash
-
-python main.py \
-    --config-path configs/class \
-    --config-name imagenet100_10-10.yaml \
-    dataset_root="[imagenet_1k_path]" \
-    class_order="class_orders/imagenet100.yaml"
+﻿#!/bin/bash
 
 python main.py \
     --config-path configs/class \
@@ -15,5 +9,5 @@ python main.py \
 python main.py \
     --config-path configs/class \
     --config-name cifar100_10-10.yaml \
-    dataset_root="[cifar100_path]" \
+    dataset_root="[cifar100_root]" \
     class_order="class_orders/cifar100_order.yaml"
