@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import os
 
@@ -28,7 +28,7 @@ class ImageNetR(ImageFolderDataset):
         return super().get_data()
 
 
-def get_dataset(cfg, is_train, transforms_=None):  # noqa: ARG001
+def get_dataset(cfg, is_train):
     if cfg.dataset == "cifar100":
         dataset = CIFAR100(data_path=cfg.dataset_root, download=True, train=is_train)
         classes_names = dataset.dataset.classes
@@ -42,8 +42,7 @@ def get_dataset(cfg, is_train, transforms_=None):  # noqa: ARG001
 
 
 def _build_transform(cfg, base_transforms):
-    dataset_name = cfg.dataset.lower() if hasattr(cfg, "dataset") else ""
-    if dataset_name.startswith("cifar"):
+    if cfg.dataset == "cifar100":
         clip_mean = (0.48145466, 0.4578275, 0.40821073)
         clip_std = (0.26862954, 0.26130258, 0.27577711)
         return transforms.Compose(
@@ -61,25 +60,11 @@ def build_class_incremental_scenarios(cfg, is_train, base_transforms) -> nn.Modu
     dataset, classes_names = get_dataset(cfg, is_train)
     transforms_to_use = _build_transform(cfg, base_transforms)
 
-    if cfg.scenario != "class":
-        raise ValueError(
-            f"You have entered `{cfg.scenario}` which is not a defined scenario. "
-            "Please choose from {'class', 'domain', 'task-agnostic'}."
-        )
-
     scenario = ClassIncremental(
         dataset,
         initial_increment=cfg.initial_increment,
         increment=cfg.increment,
-        transformations=(
-            transforms_to_use.transforms
-            if hasattr(transforms_to_use, "transforms")
-            else transforms_to_use
-        ),
+        transformations=transforms_to_use.transforms,
         class_order=cfg.class_order,
     )
     return scenario, classes_names
-
-
-ImageNet_R = ImageNetR
-build_cl_scenarios = build_class_incremental_scenarios

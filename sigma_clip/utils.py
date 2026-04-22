@@ -41,7 +41,7 @@ def save_config(config: DictConfig) -> None:
 
 def get_workdir(path: str) -> str:
     split_path = list(Path(path).resolve().parts)
-    candidates = ["RAPF"]
+    candidates = ["sigma"]
     workdir_idx = next((index for index, part in enumerate(split_path) if part in candidates), None)
     if workdir_idx is None:
         return str(Path(path).resolve())
@@ -58,12 +58,3 @@ def sigma_logit_fusion(model, outputs, raw_image_features, cfg):
 
     return outputs
 
-
-def gda_output(model, outputs, raw_image_feas, cfg):
-    """Backward-compatible alias."""
-    return sigma_logit_fusion(
-        model=model,
-        outputs=outputs,
-        raw_image_features=raw_image_feas,
-        cfg=cfg,
-    )

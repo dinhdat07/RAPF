@@ -1,4 +1,4 @@
-﻿# SIGMA-CLIP: Statistical Inference with Gaussian Memory Anchors
+# SIGMA-CLIP: Statistical Inference with Gaussian Memory Anchors
 
 Implementation for **"Statistical Memory Head for Class-Incremental Vision-Language Learning with CLIP" (ICME 2026 submission)**, with method naming updated to **SIGMA**.
 
@@ -10,8 +10,7 @@ The pipeline has two components:
 
 1. **Adapter-based incremental training**
 - Frozen CLIP image/text encoders.
-- Task-wise image/text bottleneck adapters.
-- Adapter fusion across tasks.
+- Sequential image/text linear adapters (single active pair updated task-by-task).
 - Auxiliary losses:
   - CLIP contrastive loss,
   - image augmentation consistency,
@@ -30,10 +29,9 @@ The pipeline has two components:
   - `trainer.py`: class-incremental train/eval loop.
   - `model.py`: CLIP + adapters + replay + statistics logic.
   - `data.py`: dataset/scenario construction.
-  - `config.py`: runtime config normalization (flat + `engine.*` compatible).
   - `utils.py`: class orders, workdir helpers, SIGMA logit fusion.
   - `losses.py`: CLIP/contrastive loss helpers.
-- `main.py`: thin Hydra entry wrapper to `sigma_clip.cli`.
+- `main.py`: Hydra entrypoint for SIGMA training.
 - `configs/class/`: experiment configs.
 - `class_orders/`: class order definitions.
 - `metadata/class_names/`: dataset class-name files used for prompt construction.
@@ -85,7 +83,7 @@ All runs use Hydra via `main.py`.
 
 ```bash
 python main.py \
-  --config-path configs/class \
+  --config-dir configs/class \
   --config-name cifar100_10-10.yaml \
   dataset_root="/path/to/cifar_root" \
   class_order="class_orders/cifar100_order.yaml"
@@ -95,7 +93,7 @@ python main.py \
 
 ```bash
 python main.py \
-  --config-path configs/class \
+  --config-dir configs/class \
   --config-name imagenet_r_20-20.yaml \
   dataset_root="/path/to/imagenet-r" \
   class_order="class_orders/imagenet_R_order.yaml"
@@ -124,11 +122,8 @@ Core keys (top-level):
 - `train_batch_size`, `batch_size`, `epochs`, `lr`, `seed`
 - `threshold`, `beta`, `shrinkage`
 
-SIGMA/adaptation keys (supported in both styles):
-- Flat style: `lambda_img`, `lambda_txt`, `sample_num`, `sample_noise`, `stat`, `templates`, `dropout`
-- Nested style: `engine.lambda_img`, `engine.lambda_txt`, `engine.sample_num`, `engine.sample_noise`, `engine.stat`, `engine.templates`, `engine.dropout`
-
-Runtime normalization resolves both to one behavior-preserving config.
+SIGMA/adaptation keys:
+- `lambda_img`, `lambda_txt`, `sample_num`, `sample_noise`, `stat`, `templates`
 
 ## Reproducibility Notes
 

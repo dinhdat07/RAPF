@@ -1,16 +1,10 @@
-﻿﻿hydra:
+hydra:
   run:
-    dir: ./experiments/${scenario}/${dataset}_${initial_increment}-${increment}_without_exp
+    dir: ./experiments/${dataset}_${initial_increment}-${increment}_without_exp
   job:
     chdir: true
-  job_logging:
-    version: 1
-    formatters:
-      simple:
-        format: '%(message)s'
 class_order: ''
 dataset_root: ''
-workdir: ''
 log_path: metric.json
 model_name: ViT-B/16
 prompt_template: a photo of a {}.
@@ -18,7 +12,6 @@ prompt_template: a photo of a {}.
 batch_size: 64
 initial_increment: 5
 increment: ${initial_increment}
-scenario: class
 dataset: cifar100
 num_workers: 8
 train_batch_size: 64
@@ -27,14 +20,11 @@ lr: 0.01
 fp16: false
 seed: 1993
 beta: 4.0
-mix_bias: 0.6
 threshold: 0.55
 shrinkage: false
 
-dropout: 0.1
 lambda_img: 0.5
 lambda_txt: 2
-replay_alpha: 0.25
 sample_num: 0
 stat: 0.9
 sample_noise: 0.25

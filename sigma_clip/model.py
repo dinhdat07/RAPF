@@ -1,104 +1,49 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
-import copy
-import math
-from itertools import chain
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
 import clip
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from omegaconf import DictConfig
 
 from .utils import get_class_ids_per_task, get_class_names
 
 
 class LinearAdapter(nn.Module):
-    def __init__(self, c_in: int, hidden: int):
+    def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
-        self.fc = nn.Sequential(nn.Linear(c_in, hidden))
+        self.proj = nn.Linear(in_dim, out_dim)
 
-    def forward(self, x):
-        return self.fc(x)
-
-
-class BottleneckAdapter(nn.Module):
-    def __init__(
-        self,
-        c_in: int,
-        hidden: int,
-        dropout: float = 0.1,
-        use_layernorm: bool = True,
-        learnable_scale: bool = True,
-    ):
-        super().__init__()
-        self.use_layernorm = use_layernorm
-        if use_layernorm:
-            self.layernorm = nn.LayerNorm(c_in)
-
-        self.down_proj = nn.Linear(c_in, hidden)
-        self.ln_hidden = nn.LayerNorm(hidden)
-        self.non_linear = nn.GELU()
-        self.up_proj = nn.Linear(hidden, c_in)
-        self.dropout = nn.Dropout(dropout)
-
-        if learnable_scale:
-            self.scale = nn.Parameter(torch.ones(1))
-        else:
-            self.register_buffer("scale", torch.tensor(1.0))
-
-        nn.init.kaiming_uniform_(self.down_proj.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.up_proj.weight)
-        nn.init.zeros_(self.down_proj.bias)
-        nn.init.zeros_(self.up_proj.bias)
-
-    def forward(self, x):
-        residual = x
-        if self.use_layernorm:
-            x = self.layernorm(x)
-
-        x = self.down_proj(x)
-        x = self.ln_hidden(x)
-        x = self.non_linear(x)
-
-        x = self.dropout(x)
-        x = self.up_proj(x)
-        x = x * self.scale
-
-        return residual + x
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.proj(features)
 
 
-def shrink_cov(cov):
+def shrink_cov(cov: torch.Tensor) -> torch.Tensor:
     diag_mean = torch.mean(torch.diagonal(cov))
     off_diag = cov.clone()
     off_diag.fill_diagonal_(0.0)
     mask = off_diag != 0.0
     off_diag_mean = (off_diag * mask).sum() / mask.sum()
     identity = torch.eye(cov.shape[0], device=cov.device)
-    alpha1 = 1
-    alpha2 = 1
-    return cov + (alpha1 * diag_mean * identity) + (alpha2 * off_diag_mean * (1 - identity))
+    return cov + (diag_mean * identity) + (off_diag_mean * (1 - identity))
 
 
-def sample(mean, cov, size, shrink: bool = False):
+def sample(mean: torch.Tensor, cov: torch.Tensor, size: int, shrink: bool = False) -> torch.Tensor:
     vec = torch.randn(size, mean.shape[-1], device=mean.device)
     if shrink:
         cov = shrink_cov(cov)
     sqrt_cov = torch.linalg.cholesky(cov)
-    vec = vec @ sqrt_cov.t()
-    vec = vec + mean
-    return vec
+    return vec @ sqrt_cov.t() + mean
 
 
 class SigmaClassIncrementalCLIP(nn.Module):
-    def __init__(self, cfg, device, jit: bool = False):
+    def __init__(self, cfg: DictConfig, device: torch.device, jit: bool = False):
         super().__init__()
         self.cfg = cfg
         self.prompt_template = cfg.prompt_template
         self.device = device
         self.classes_names = None
-        self.new_des_dict = None
 
         model, self.transforms = clip.load(cfg.model_name, device=device, jit=jit)
         for param in model.parameters():
@@ -121,37 +66,36 @@ class SigmaClassIncrementalCLIP(nn.Module):
         self.clip_type = model.dtype
         self.tokenize = clip.tokenize
 
-        dropout_rate = float(getattr(cfg, "dropout", 0.1))
-        self.uni_image_adapter = BottleneckAdapter(512, 256, dropout=dropout_rate).to(self.device).to(dtype=self.dtype)
-        self.uni_text_adapter = BottleneckAdapter(512, 256, dropout=dropout_rate).to(self.device).to(dtype=self.dtype)
-        self.freeze(self.uni_image_adapter)
-        self.freeze(self.uni_text_adapter)
-
-        self.image_fusion_alpha = nn.Parameter(torch.ones(1))
-        self.image_fusion_beta = nn.Parameter(torch.ones(1))
-        self.text_fusion_alpha = nn.Parameter(torch.ones(1))
-        self.text_fusion_beta = nn.Parameter(torch.ones(1))
+        # Sequential adapters: one active image adapter and one active text adapter.
+        self.image_adapter = None
+        self.text_adapter = None
 
         self.lambda_img = cfg.lambda_img
         self.lambda_txt = cfg.lambda_txt
-        self.replay_alpha = cfg.replay_alpha
         self.replay_sample_num = cfg.sample_num
         self.sample_noise = cfg.sample_noise
 
-        self.image_injection = nn.ModuleList()
-        self.text_injection = nn.ModuleList()
-        self.prototype: List[torch.Tensor] = []
+        self.prototype = []
         self.class_mean_list = []
         self.class_cov_list = []
         self.class_diff = None
         self.nearest_class = None
         self.class_edge_distance = []
+        self.templates_per_class = 1
+        self.class_name_features = None
+        self.mu = None
+        self.cov_inv = None
+        self.W = None
+        self.b = None
+
+    def init_adapter(self) -> None:
+        self.image_adapter = LinearAdapter(512, 512).to(self.device).to(dtype=self.dtype)
+        self.text_adapter = LinearAdapter(512, 512).to(self.device).to(dtype=self.dtype)
 
     def update_stat(self, known_classes, total_classes, train_loader, device):
         print("Updating stat...")
         with torch.no_grad():
-            vectors = []
-            labels = []
+            vectors, labels = [], []
             for images, targets, _ in train_loader:
                 images, targets = images.to(device), targets.to(device)
                 image_features = self.encode_image(images).float()
@@ -159,7 +103,7 @@ class SigmaClassIncrementalCLIP(nn.Module):
                 vectors.append(image_features)
                 labels.append(targets)
 
-            if len(vectors) == 0:
+            if not vectors:
                 return
 
             vectors = torch.cat(vectors)
@@ -171,7 +115,7 @@ class SigmaClassIncrementalCLIP(nn.Module):
                 if class_vectors.numel() > 0:
                     mu_list.append(class_vectors.mean(dim=0, keepdim=True))
 
-            if len(mu_list) == 0:
+            if not mu_list:
                 return
 
             mu = torch.cat(mu_list, dim=0)
@@ -181,7 +125,7 @@ class SigmaClassIncrementalCLIP(nn.Module):
                 if class_vectors.numel() > 0:
                     center_list.append(class_vectors - mu[index])
 
-            if len(center_list) == 0:
+            if not center_list:
                 return
 
             center_vectors = torch.cat(center_list, dim=0)
@@ -190,7 +134,7 @@ class SigmaClassIncrementalCLIP(nn.Module):
             reg = cov.trace() * torch.eye(dim, device=device)
             cov_inv = dim * torch.linalg.pinv((center_vectors.shape[0] - 1) * cov + reg)
 
-            if not hasattr(self, "mu"):
+            if self.mu is None:
                 self.mu = mu
                 self.cov_inv = cov_inv
             else:
@@ -215,13 +159,11 @@ class SigmaClassIncrementalCLIP(nn.Module):
 
     def get_trainable_parameters(self):
         params = []
-        if self.image_injection and len(self.image_injection) > 0:
-            params.append(self.image_injection[-1].parameters())
-            params.append([self.image_fusion_alpha, self.image_fusion_beta])
-        if self.text_injection and len(self.text_injection) > 0:
-            params.append(self.text_injection[-1].parameters())
-            params.append([self.text_fusion_alpha, self.text_fusion_beta])
-        return chain.from_iterable(params)
+        if self.image_adapter is not None:
+            params.append(self.image_adapter.parameters())
+        if self.text_adapter is not None:
+            params.append(self.text_adapter.parameters())
+        return (param for group in params for param in group)
 
     def encode_text(self, text):
         x = self.token_embedding(text).type(self.clip_type)
@@ -230,81 +172,27 @@ class SigmaClassIncrementalCLIP(nn.Module):
         x = self.transformer(x)
         x = x.permute(1, 0, 2)
         x = self.ln_final(x)
-        x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
-        return x
+        return x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
 
     def encode_image(self, image):
         return self.visual(image.to(self.clip_type))
 
-    def freeze(self, module):
-        for param in module.parameters():
-            param.requires_grad = False
-
-    def update_injection_units(self, noise_std: float = 0.01):
-        for inj in self.image_injection: 
-            self.freeze(inj)
-        for inj in self.text_injection:
-            self.freeze(inj)
-
-        if self.image_injection:
-            new_image_adapter = copy.deepcopy(self.image_injection[-1])
-            for param in new_image_adapter.parameters():
-                param.data += noise_std * torch.randn_like(param.data)
-                param.requires_grad = True 
-            
-            if hasattr(new_image_adapter, 'scale'):
-                with torch.no_grad():
-                    new_image_adapter.scale.fill_(1.0)
-            self.image_injection.append(new_image_adapter.to(self.device).to(dtype=self.dtype))
-        else:
-            self.image_injection.append(
-                LinearAdapter(512, 512).to(self.device).to(dtype=self.dtype)
-            )
-
-        if self.text_injection:
-            new_text_adapter = copy.deepcopy(self.text_injection[-1])
-            for param in new_text_adapter.parameters():
-                param.data += noise_std * torch.randn_like(param.data)
-                param.requires_grad = True
-            
-            if hasattr(new_text_adapter, 'scale'):
-                with torch.no_grad():
-                    new_text_adapter.scale.fill_(1.0)
-
-            self.text_injection.append(new_text_adapter.to(self.device).to(dtype=self.dtype))
-        else:
-            self.text_injection.append(
-                LinearAdapter(512, 512).to(self.device).to(dtype=self.dtype)
-            )
-
     def apply_image_injection(self, features):
-        if not self.cfg.img_injection or len(self.image_injection) == 0:
-            return features
-        try:
-            target_dtype = next(self.image_injection[0].parameters()).dtype
-        except StopIteration:
-            target_dtype = features.dtype
-        features = features.to(dtype=target_dtype)
-        task_output = self.image_injection[-1](features)
-        return task_output
+        if self.image_adapter is None:
+            raise RuntimeError("Image adapter is not initialized. Call update_injection_units() first.")
+        target_dtype = next(self.image_adapter.parameters()).dtype
+        return self.image_adapter(features.to(dtype=target_dtype))
 
     def apply_text_injection(self, features):
-        if not self.cfg.txt_injection or len(self.text_injection) == 0:
-            return features
-        try:
-            target_dtype = next(self.text_injection[0].parameters()).dtype
-        except StopIteration:
-            target_dtype = features.dtype
-            
-        features = features.to(dtype=target_dtype)
-        task_output = self.text_injection[-1](features)
-        return task_output
-    
+        if self.text_adapter is None:
+            raise RuntimeError("Text adapter is not initialized. Call update_injection_units() first.")
+        target_dtype = next(self.text_adapter.parameters()).dtype
+        return self.text_adapter(features.to(dtype=target_dtype))
 
     @torch.no_grad()
     def get_class_name_features(self):
         class_name_features = self.encode_text(self.text_tokens)
-        templates_per_class = getattr(self, "templates_per_class", 1)
+        templates_per_class = self.templates_per_class
         if templates_per_class > 1:
             num_classes = len(self.total_class_names)
             class_name_features = class_name_features.view(num_classes, templates_per_class, -1)
@@ -317,10 +205,7 @@ class SigmaClassIncrementalCLIP(nn.Module):
         self.total_class_names += get_class_names(self.classes_names, self.class_ids_per_task[task_id])
         self.current_class_names = get_class_names(self.classes_names, self.class_ids_per_task[task_id])
 
-        if self.cfg.templates:
-            prompt_templates = self.cfg.templates
-        else:
-            prompt_templates = [self.prompt_template]
+        prompt_templates = self.cfg.templates
 
         self.templates_per_class = len(prompt_templates)
         all_prompts = []
@@ -330,15 +215,12 @@ class SigmaClassIncrementalCLIP(nn.Module):
         self.text_tokens = self.tokenize(all_prompts).to(self.device)
         self.text_end = self.text_tokens.max(dim=-1)[1]
         self.class_name_features = self.get_class_name_features()
-        self.class_name_features = self.class_name_features / self.class_name_features.norm(
-            dim=-1, p=2, keepdim=True
-        )
+        self.class_name_features = self.class_name_features / self.class_name_features.norm(dim=-1, p=2, keepdim=True)
 
         self.queue_empty = True
         self.hard_pairs = None
 
         if task_id > 0:
-            self.update_injection_units()
             dist_list = []
             old_count = len(self.class_ids_per_task[task_id])
             for class_name_feature in self.class_name_features[:-old_count]:
@@ -352,9 +234,13 @@ class SigmaClassIncrementalCLIP(nn.Module):
             self.class_diff = dist_list
             mask = self.class_diff < threshold
             indices = torch.nonzero(mask)
-            self.hard_new_class = torch.unique(indices[:, 1]) + self.cfg.initial_increment + (task_id - 1) * self.cfg.increment
+            self.hard_new_class = (
+                torch.unique(indices[:, 1]) + self.cfg.initial_increment + (task_id - 1) * self.cfg.increment
+            )
             self.hard_pairs = indices
-            self.hard_pairs[:, 1] = self.hard_pairs[:, 1] + self.cfg.initial_increment + (task_id - 1) * self.cfg.increment
+            self.hard_pairs[:, 1] = (
+                self.hard_pairs[:, 1] + self.cfg.initial_increment + (task_id - 1) * self.cfg.increment
+            )
 
     def forward(self, image, ori_ima_f: bool = False, memory_data=None, not_ini: bool = False, edge_sample=None):
         image = image.type(self.dtype)
@@ -391,17 +277,9 @@ class SigmaClassIncrementalCLIP(nn.Module):
             edge_sample_features = final_image_features[-edge_num:]
             final_image_features = final_image_features[:-edge_num]
 
-        if hasattr(self, "class_name_features") and self.class_name_features is not None:
-            text_features = self.class_name_features
-        else:
-            with torch.no_grad():
-                text_features = self.encode_text(self.text_tokens)
-            templates_per_class = getattr(self, "templates_per_class", 1)
-            if templates_per_class > 1:
-                num_classes = len(self.total_class_names)
-                text_features = text_features.view(num_classes, templates_per_class, -1)
-                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-                text_features = text_features.mean(dim=1)
+        if self.class_name_features is None:
+            raise RuntimeError("Class-name features are not initialized. Call adaptation() first.")
+        text_features = self.class_name_features
 
         final_text_features = self.apply_text_injection(text_features)
         final_text_features = final_text_features / final_text_features.norm(dim=-1, keepdim=True)
@@ -414,8 +292,22 @@ class SigmaClassIncrementalCLIP(nn.Module):
                 old_memory_feature = self.apply_image_injection(memory_data)
                 old_memory_feature = old_memory_feature / old_memory_feature.norm(dim=1, keepdim=True)
             if edge_sample is not None:
-                return probs, final_image_features, old_memory_feature, edge_sample_features, image_features_for_logits, raw_image_features
-            return probs, final_image_features, old_memory_feature, final_text_features, image_features_for_logits, raw_image_features
+                return (
+                    probs,
+                    final_image_features,
+                    old_memory_feature,
+                    edge_sample_features,
+                    image_features_for_logits,
+                    raw_image_features,
+                )
+            return (
+                probs,
+                final_image_features,
+                old_memory_feature,
+                final_text_features,
+                image_features_for_logits,
+                raw_image_features,
+            )
 
         if ori_ima_f:
             if memory_data is not None:
@@ -431,7 +323,7 @@ class SigmaClassIncrementalCLIP(nn.Module):
             class_data = features[index]
             mean = class_data.mean(dim=0)
             proto = mean.detach().to(torch.float32)
-            class_idx = int(class_label.item()) if hasattr(class_label, "item") else int(class_label)
+            class_idx = int(class_label.item())
 
             if len(self.prototype) <= class_idx:
                 self.prototype.append(proto)
@@ -452,13 +344,4 @@ class SigmaClassIncrementalCLIP(nn.Module):
             self.class_cov_list.append(cov)
 
     def _get_text_anchor(self, classnames: Iterable[str]) -> List[str]:
-        out: List[str] = []
-        for cname in classnames:
-            out.append(f"a photo of {cname}")
-        return out
-
-
-
-def load_model(cfg: DictConfig, device: torch.device) -> nn.Module:
-    return SigmaClassIncrementalCLIP(cfg, device)
-
+        return [f"a photo of {cname}" for cname in classnames]

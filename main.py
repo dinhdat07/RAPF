@@ -1,5 +1,5 @@
-﻿from sigma_clip.cli import continual_clip
+from sigma_clip.cli import run_sigma
 
 
 if __name__ == "__main__":
-    continual_clip()
+    run_sigma()

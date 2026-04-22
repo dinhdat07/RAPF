@@ -1,11 +1,11 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import logging
 import os
 import random
 import statistics
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -40,7 +40,7 @@ def _replay_classes_for_batch(cfg, task_id: int, batch_id: int, random_class_ord
     elif cfg.dataset == "imagenet_R":
         batch_span = 5
     else:
-        batch_span = 2
+        raise ValueError(f"Unsupported dataset for replay scheduling: {cfg.dataset}")
 
     return [
         random_class_order_list[(batch_id * batch_span + offset) % len(random_class_order_list)]
@@ -60,7 +60,7 @@ def _build_replay_batch(
         return None, None
 
     selected_classes = _replay_classes_for_batch(cfg, task_id, batch_id, random_class_order_list)
-    if getattr(model, "replay_sample_num", 0) > 0:
+    if model.replay_sample_num > 0:
         sample_count = min(len(selected_classes), model.replay_sample_num)
         selected_classes = random.sample(selected_classes, sample_count)
 
@@ -262,7 +262,7 @@ def _train_single_epoch(
         optimizer.zero_grad()
 
         tqdm_loader.set_description(
-            f"Ep {scheduler.last_epoch + 2}/{cfg.epochs} | L: {loss.item():.4f} | "
+            f"Ep {scheduler.last_epoch + 1}/{cfg.epochs} | L: {loss.item():.4f} | "
             f"clip_loss: {clip_loss.item():.4f} | lr: {scheduler.get_last_lr()[0]:.4f}"
         )
 
@@ -318,13 +318,12 @@ def _write_task_metrics(cfg, metric_logger, task_id: int, acc_list: List[float])
     bwt = 100 * metric_logger.backward_transfer
     fwt = 100 * metric_logger.forward_transfer
 
-    train_acc = 100 * metric_logger.online_accuracy if hasattr(metric_logger, "online_accuracy") else None
+    train_acc = 100 * metric_logger.online_accuracy
     acc_list.append(test_acc)
-    train_acc_str = f"{train_acc:.2f}" if train_acc is not None else "None"
 
     print(
         f"[Task {task_id}] "
-        f"train_acc={train_acc_str} | "
+        f"train_acc={train_acc:.2f} | "
         f"test_acc={test_acc:.2f} | avg_acc={avg_acc:.2f} | "
         f"forgetting={forgetting_val:.6f}"
     )
@@ -334,7 +333,7 @@ def _write_task_metrics(cfg, metric_logger, task_id: int, acc_list: List[float])
             json.dumps(
                 {
                     "task": task_id,
-                    "train_acc": round(train_acc, 2) if train_acc is not None else None,
+                    "train_acc": round(train_acc, 2),
                     "test_acc": round(test_acc, 2),
                     "avg_acc": round(avg_acc, 2),
                     "forgetting": round(forgetting_val, 6),
@@ -353,7 +352,7 @@ def run_class_incremental(cfg, device):
 
     model = SigmaClassIncrementalCLIP(cfg, device)
     freeze_clip_backbone(model)
-    model.update_injection_units()
+    model.init_adapter()
 
     eval_dataset, classes_names = build_class_incremental_scenarios(
         cfg,
